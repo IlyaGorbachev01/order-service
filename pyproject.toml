@@ -9,9 +9,66 @@ authors = [
 requires-python = ">=3.13"
 dependencies = []
 
-[project.scripts]
-order-service = "order_service:main"
+[dependency-groups]
+dev = []
 
-[build-system]
-requires = ["uv_build>=0.12.7,<0.13.0"]
-build-backend = "uv_build"
+[tool.ruff]
+line-length = 88  # Значение по умолчанию для ruff, но отличается от PEP8
+target-version = "py313"
+
+extend-exclude = [
+    "alembic/versions",  # Автогенерируемые миграции
+]
+
+[tool.ruff.lint]
+select = [
+    "ANN",      # flake8-annotations
+    "ARG",      # flake8-unused-arguments
+    "ASYNC",    # flake8-async
+    "B",        # flake8-bugbear
+    "C4",       # flake8-comprehensions
+    "COM",      # flake8-commas
+    "D",        # pydocstyle
+    "E",        # pycodestyle
+    "F",        # pyflakes
+    "G",        # flake8-logging-format
+    "I",        # isort
+    "N",        # pep8-naming
+    "PIE",      # flake8-pie
+    "PLC0415",  # import-outside-top-level
+    "PT",       # flake8-pytest-style
+    "Q",        # flake8-quotes
+    "RET",      # flake8-return
+    "RUF",      # Ruff
+    "SIM",      # flake8-simplify
+    "TC",       # flake8-type-checking
+    "UP",       # pyupgrade
+    "W",        # pycodestyle (warnings)
+]
+
+ignore = [
+    "ANN401",   # Dynamically typed expressions (typing.Any)
+    "COM812",   # Checks for the absence of trailing commas
+    "D100",     # Missing docstring in public module
+    "D104",     # Missing docstring in public package
+    "D107",     # Missing docstring in `__init__`
+    "RUF001",   # Checks for ambiguous Unicode characters in strings
+    "RUF002",   # Checks for ambiguous Unicode characters in docstrings
+    "RUF003",   # Checks for ambiguous Unicode characters in comments
+    "SIM108",   # Use ternary operator
+]
+
+unfixable = [
+    "F841",   # Не удалять автоматически неиспользуемые переменные
+    "ERA001", # Не удалять закомментированный код автоматически
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

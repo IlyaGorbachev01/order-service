@@ -47,6 +47,7 @@ select = [
 ]
 
 ignore = [
+    "ANN204",   # Missing return type annotation for special method
     "ANN401",   # Dynamically typed expressions (typing.Any)
     "COM812",   # Checks for the absence of trailing commas
     "D100",     # Missing docstring in public module

@@ -6,6 +6,7 @@ from decimal import Decimal
 @dataclass
 class CatalogItem:
     """Позиция каталога."""
+
     id: str
     name: str
     price: Decimal
@@ -14,6 +15,7 @@ class CatalogItem:
 
 class CatalogClient(ABC):
     """Абстрактный клиент каталога товаров."""
+
     @abstractmethod
     async def get_item(self, item_id: str) -> CatalogItem:
         """Получить информацию о товаре из каталога."""

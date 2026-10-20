@@ -2,15 +2,18 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 
 from src.application.ports.catalog import CatalogClient
+from src.application.ports.payments import PaymentRequest, PaymentsClient
 from src.application.ports.uow import BaseUnitOfWork
-from src.domain.entities import Order, OrderStatus
+from src.domain.entities import Order, OrderStatus, PaymentStatus
 from src.domain.exceptions import (
     CatalogUnavailableError,
     InsufficientStockError,
+    PaymentServiceError,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,14 +27,21 @@ class CreateOrderCommand:
     quantity: int
     item_id: str
     idempotency_key: str
+    callback_url: str = ""
 
 
 class CreateOrderUseCase:
     """Use Case: создание заказа с гарантией идемпотентности."""
 
-    def __init__(self, uow: BaseUnitOfWork, catalog_client: CatalogClient):
+    def __init__(
+        self,
+        uow: BaseUnitOfWork,
+        catalog_client: CatalogClient,
+        payments_client: PaymentsClient | None = None,
+    ):
         self._uow = uow
         self._catalog_client = catalog_client
+        self._payments_client = payments_client
 
     async def __call__(self, command: CreateOrderCommand) -> Order:
         """Выполнить сценарий создания заказа."""
@@ -79,8 +89,78 @@ class CreateOrderUseCase:
                 updated_at=now,
             )
 
-            # 4. Сохранение и коммит
-            return await uow.orders.create(order)
+            # 4. Сохранение заказа в статусе NEW (коммит транзакции)
+            order = await uow.orders.create(order)
+            amount = item.price * command.quantity
+
+        # 5. Создание платежа — вне транзакции БД (внешний HTTP-вызов
+        #    не должен держать соединение/транзакцию открытыми).
+        if self._payments_client is not None:
+            order = await self._create_payment(order, amount, command.callback_url)
+
+        return order
+
+    async def _create_payment(
+        self, order: Order, amount: Decimal, callback_url: str
+    ) -> Order:
+        """Создать платёж через Payments Service.
+
+        При недоступности сервиса или отклонении платежа заказ отменяется
+        (CANCELLED) и бросается PaymentServiceError. Если сервис вернул
+        синхронный успех (succeeded) — заказ сразу переходит в PAID;
+        при pending итог придёт на callback_url.
+        """
+        request = PaymentRequest(
+            order_id=order.id,
+            amount=amount,
+            callback_url=callback_url,
+            idempotency_key=self._build_payment_idempotency_key(order.id),
+        )
+        try:
+            result = await self._payments_client.create_payment(request)
+        except PaymentServiceError:
+            await self._cancel_order(order.id, reason="Payment service error")
+            raise
+        except Exception as e:  # любой сбой клиента = отмена заказа
+            logger.warning("Payments client failure for order %s: %s", order.id, e)
+            await self._cancel_order(order.id, reason=f"Payment failed: {e}")
+            raise PaymentServiceError(
+                f"Не удалось создать платёж для заказа {order.id}: {e}"
+            ) from e
+
+        async with self._uow() as uow:
+            fresh = await uow.orders.get_by_id(order.id)
+            if fresh is None:  # pragma: no cover - защита от гонки удаления
+                raise PaymentServiceError(f"Заказ {order.id} исчез из хранилища.")
+
+            if result.status is PaymentStatus.SUCCEEDED:
+                fresh.mark_paid(payment_id=result.id)
+            elif result.status is PaymentStatus.FAILED:
+                fresh.mark_cancelled(reason="Payment rejected by service")
+            else:  # PENDING — ждём callback
+                fresh.payment_id = result.id
+
+            updated = await uow.orders.update(fresh)
+            logger.info(
+                "Order %s: payment %s created, status=%s",
+                order.id,
+                result.id,
+                updated.status.value,
+            )
+            return updated
+
+    async def _cancel_order(self, order_id: str, reason: str) -> None:
+        """Отменить заказ после сбоя платежа (best-effort)."""
+        async with self._uow() as uow:
+            order = await uow.orders.get_by_id(order_id)
+            if order is None or order.status in (
+                OrderStatus.CANCELLED,
+                OrderStatus.SHIPPED,
+            ):
+                return
+            order.mark_cancelled(reason=reason)
+            await uow.orders.update(order)
+            logger.info("Order %s cancelled: %s", order_id, reason)
 
     @staticmethod
     def _build_payment_idempotency_key(order_id: str) -> str:

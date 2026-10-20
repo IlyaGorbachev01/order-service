@@ -3,7 +3,11 @@ from http import HTTPStatus
 from fastapi import APIRouter, HTTPException
 
 from src.application.usecases.create_order import CreateOrderCommand
-from src.domain.exceptions import InsufficientStockError, OrderNotFoundError
+from src.domain.exceptions import (
+    CatalogUnavailableError,
+    InsufficientStockError,
+    OrderNotFoundError,
+)
 from src.presentation.api.dependencies import CreateOrderUseCaseDep, GetOrderUseCaseDep
 from src.presentation.api.schemas import OrderCreateRequest, OrderResponse
 
@@ -27,6 +31,10 @@ async def create_order(
         return OrderResponse.model_validate(order)
     except InsufficientStockError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
+    except CatalogUnavailableError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
 
 
 @router.get("/{order_id}", status_code=HTTPStatus.OK, response_model=OrderResponse)

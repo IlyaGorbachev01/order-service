@@ -1,6 +1,46 @@
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _build_database_url_from_parts() -> str | None:
+    """Собирает DATABASE_URL из отдельных переменных окружения.
+
+    LMS-портал предоставляет PostgreSQL через переменные POSTGRES_*
+    (POSTGRES_CONNECTION_STRING вида postgres://user:password@host:port,
+    POSTGRES_DATABASE_NAME, POSTGRES_HOST, POSTGRES_PORT).
+    Схема postgresql:// не поддерживается asyncpg напрямую,
+    поэтому приводим её к postgresql+asyncpg:// и добавляем имя БД.
+    """
+    conn_str = os.environ.get("POSTGRES_CONNECTION_STRING")
+    if not conn_str:
+        return None
+
+    url = conn_str.strip()
+    body = url.split("://", 1)[1] if "://" in url else url
+
+    credentials, _, host_part = body.rpartition("@")
+    host = os.environ.get("POSTGRES_HOST")
+    port = os.environ.get("POSTGRES_PORT")
+    db_name = os.environ.get("POSTGRES_DATABASE_NAME", "")
+
+    if host:
+        netloc = f"{host}:{port}" if port else host
+    else:
+        # хост/порт берём из connection string, имя БД в пути отбрасываем
+        netloc = host_part.split("/", 1)[0]
+
+    path = f"/{db_name}" if db_name else ""
+    if credentials:
+        return f"postgresql+asyncpg://{credentials}@{netloc}{path}"
+    return f"postgresql+asyncpg://{netloc}{path}"
+
+
+def _default_database_url() -> str:
+    return _build_database_url_from_parts() or (
+        "postgresql+asyncpg://postgres:postgres@localhost:5432/order_db"
+    )
 
 
 class Settings(BaseSettings):
@@ -9,11 +49,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="forbid",  # Строгий контроль: запрещаем неизвестные переменные окружения
+        extra="ignore",  # Портал передаёт много служебных переменных — не падаем на них
     )
 
-    # База данных
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/order_db"
+    # База данных: приоритет у явного DATABASE_URL, иначе сборка из POSTGRES_*
+    database_url: str = _default_database_url()
 
     # Capashino API
     capashino_internal_url: str = (

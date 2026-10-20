@@ -12,3 +12,7 @@ class InsufficientStockError(OrderError):
 
 class DuplicateOrderError(OrderError):
     """Заказ с таким idempotency_key уже существует."""
+
+
+class CatalogUnavailableError(OrderError):
+    """Товар не найден в каталоге или Catalog Service недоступен."""

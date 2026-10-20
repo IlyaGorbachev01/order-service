@@ -1,11 +1,19 @@
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import httpx
+
 from src.application.ports.catalog import CatalogClient
 from src.application.ports.uow import BaseUnitOfWork
 from src.domain.entities import Order, OrderStatus
-from src.domain.exceptions import InsufficientStockError
+from src.domain.exceptions import (
+    CatalogUnavailableError,
+    InsufficientStockError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -35,8 +43,23 @@ class CreateOrderUseCase:
             if existing_order:
                 return existing_order
 
-            # 2. Проверка наличия товара
-            item = await self._catalog_client.get_item(command.item_id)
+            # 2. Проверка наличия товара (ошибки Catalog Service — доменные)
+            try:
+                item = await self._catalog_client.get_item(command.item_id)
+            except httpx.HTTPStatusError as e:
+                logger.warning(
+                    "Catalog error for item %s: %s",
+                    command.item_id,
+                    e.response.status_code,
+                )
+                raise CatalogUnavailableError(
+                    f"Товар {command.item_id} не найден в каталоге "
+                    f"(HTTP {e.response.status_code})."
+                ) from e
+            except httpx.HTTPError as e:
+                logger.warning("Catalog service unavailable: %s", e)
+                raise CatalogUnavailableError(f"Catalog Service недоступен: {e}") from e
+
             if item.available_qty < command.quantity:
                 raise InsufficientStockError(
                     f"Недостаточно товара {command.item_id}. "

@@ -1,0 +1,42 @@
+from http import HTTPStatus
+
+from fastapi import APIRouter, HTTPException
+
+from src.application.usecases.create_order import CreateOrderCommand
+from src.domain.exceptions import InsufficientStockError, OrderNotFoundError
+from src.presentation.api.dependencies import CreateOrderUseCaseDep, GetOrderUseCaseDep
+from src.presentation.api.schemas import OrderCreateRequest, OrderResponse
+
+router = APIRouter(prefix="/api/orders", tags=["Orders"])
+
+
+@router.post("", status_code=HTTPStatus.CREATED, response_model=OrderResponse)
+async def create_order(
+    request: OrderCreateRequest,
+    use_case: CreateOrderUseCaseDep,
+) -> OrderResponse:
+    """Создает новый заказ."""
+    try:
+        command = CreateOrderCommand(
+            user_id=request.user_id,
+            quantity=request.quantity,
+            item_id=request.item_id,
+            idempotency_key=request.idempotency_key,
+        )
+        order = await use_case(command)
+        return OrderResponse.model_validate(order)
+    except InsufficientStockError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
+
+
+@router.get("/{order_id}", status_code=HTTPStatus.OK, response_model=OrderResponse)
+async def get_order(
+    order_id: str,
+    use_case: GetOrderUseCaseDep,
+) -> OrderResponse:
+    """Возвращает заказ по идентификатору."""
+    try:
+        order = await use_case(order_id)
+        return OrderResponse.model_validate(order)
+    except OrderNotFoundError as e:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=str(e)) from e

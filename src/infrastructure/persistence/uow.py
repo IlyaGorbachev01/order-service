@@ -2,9 +2,15 @@ from types import TracebackType
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.application.ports.repositories import OrderRepository
+from src.application.ports.repositories import (
+    OrderRepository,
+    PaymentCallbackRepository,
+)
 from src.application.ports.uow import BaseUnitOfWork
-from src.infrastructure.persistence.repositories import OrderRepositoryImpl
+from src.infrastructure.persistence.repositories import (
+    OrderRepositoryImpl,
+    PaymentCallbackRepositoryImpl,
+)
 
 
 class UnitOfWorkImpl(BaseUnitOfWork):
@@ -14,6 +20,7 @@ class UnitOfWorkImpl(BaseUnitOfWork):
         self._session_factory = session_factory
         self._session: AsyncSession | None = None
         self._order_repo: OrderRepository | None = None
+        self._payment_callback_repo: PaymentCallbackRepository | None = None
 
     @property
     def orders(self) -> OrderRepository:
@@ -28,11 +35,20 @@ class UnitOfWorkImpl(BaseUnitOfWork):
         assert self._order_repo is not None
         return self._order_repo
 
+    @property
+    def payment_callbacks(self) -> PaymentCallbackRepository:
+        """Возвращает репозиторий обработанных callback-ов Payments Service."""
+        if self._payment_callback_repo is None:
+            self._begin()
+        assert self._payment_callback_repo is not None
+        return self._payment_callback_repo
+
     def _begin(self) -> None:
         """Открывает сессию и инициализирует репозитории (идемпотентно)."""
         if self._session is None:
             self._session = self._session_factory()
             self._order_repo = OrderRepositoryImpl(self._session)
+            self._payment_callback_repo = PaymentCallbackRepositoryImpl(self._session)
 
     async def __aenter__(self) -> "UnitOfWorkImpl":
         """Открывает сессию и инициализирует репозитории."""
@@ -52,6 +68,7 @@ class UnitOfWorkImpl(BaseUnitOfWork):
             await self._session.close()
         self._session = None
         self._order_repo = None
+        self._payment_callback_repo = None
 
     async def close(self) -> None:
         """Закрывает сессию без commit/rollback (для внешнего управления)."""
@@ -59,6 +76,7 @@ class UnitOfWorkImpl(BaseUnitOfWork):
             await self._session.close()
         self._session = None
         self._order_repo = None
+        self._payment_callback_repo = None
 
     async def commit(self) -> None:
         """Фиксирует текущую транзакцию."""

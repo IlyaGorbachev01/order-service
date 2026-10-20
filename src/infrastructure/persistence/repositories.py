@@ -1,9 +1,17 @@
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.application.ports.repositories import OrderRepository
-from src.domain.entities import Order, OrderStatus
-from src.infrastructure.persistence.models import OrderModel
+from src.application.ports.repositories import (
+    OrderRepository,
+    PaymentCallbackRepository,
+)
+from src.domain.entities import Order, OrderStatus, PaymentCallback
+from src.domain.exceptions import (
+    DuplicatePaymentCallbackError,
+    OrderNotFoundError,
+)
+from src.infrastructure.persistence.models import OrderModel, PaymentCallbackModel
 
 
 class OrderRepositoryImpl(OrderRepository):
@@ -42,6 +50,8 @@ class OrderRepositoryImpl(OrderRepository):
             quantity=order.quantity,
             status=order.status.value,
             idempotency_key=order.idempotency_key,
+            payment_id=order.payment_id,
+            cancel_reason=order.cancel_reason,
             created_at=order.created_at,
             updated_at=order.updated_at,
         )
@@ -49,10 +59,22 @@ class OrderRepositoryImpl(OrderRepository):
         await self._session.flush()
         return order
 
+    async def update(self, order: Order) -> Order:
+        """Сохранить изменения существующего заказа (статус, payment_id и т.п.)."""
+        model = await self._session.get(OrderModel, order.id)
+        if model is None:
+            raise OrderNotFoundError(f"Заказ {order.id} не найден для обновления.")
+        model.status = order.status.value
+        model.payment_id = order.payment_id
+        model.cancel_reason = order.cancel_reason
+        model.updated_at = order.updated_at
+        await self._session.flush()
+        return order
+
     @staticmethod
     def _to_entity(model: OrderModel) -> Order:
         """Преобразовать ORM-модель в доменную сущность."""
-        return Order(
+        order = Order(
             id=model.id,
             user_id=model.user_id,
             item_id=model.item_id,
@@ -61,4 +83,46 @@ class OrderRepositoryImpl(OrderRepository):
             idempotency_key=model.idempotency_key,
             created_at=model.created_at,
             updated_at=model.updated_at,
+            payment_id=model.payment_id,
         )
+        if model.cancel_reason:
+            order.cancel_reason = model.cancel_reason
+        return order
+
+
+class PaymentCallbackRepositoryImpl(PaymentCallbackRepository):
+    """SQLAlchemy-реализация репозитория обработанных callback-ов.
+
+    Идемпотентность обеспечивается первичным ключом payment_id:
+    повторная вставка бросает IntegrityError, который транслируется
+    в доменный DuplicatePaymentCallbackError.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def exists(self, payment_id: str) -> bool:
+        """Возвращает True, если callback с таким payment_id уже обработан."""
+        stmt = select(PaymentCallbackModel.payment_id).where(
+            PaymentCallbackModel.payment_id == payment_id
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    async def save(self, callback: PaymentCallback) -> None:
+        """Записать факт обработки callback-а (flush без commit — за UoW)."""
+        model = PaymentCallbackModel(
+            payment_id=callback.payment_id,
+            order_id=callback.order_id,
+            status=callback.status.value,
+            amount=callback.amount,
+            error_message=callback.error_message,
+            received_at=callback.received_at,
+        )
+        self._session.add(model)
+        try:
+            await self._session.flush()
+        except IntegrityError as e:
+            raise DuplicatePaymentCallbackError(
+                f"Callback для платежа {callback.payment_id} уже обработан."
+            ) from e

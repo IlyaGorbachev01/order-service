@@ -17,18 +17,26 @@ class UnitOfWorkImpl(BaseUnitOfWork):
 
     @property
     def orders(self) -> OrderRepository:
-        """Возвращает репозиторий заказов."""
-        if self._order_repo is None or self._session is None:
-            raise RuntimeError(
-                "UnitOfWork не инициализирован."
-                "Используйте его как контекстный менеджер."
-            )
+        """Возвращает репозиторий заказов.
+
+        При первом обращении вне открытой транзакции лениво открывает
+        сессию, чтобы UoW можно было использовать и напрямую
+        (`uow.orders`), и как контекстный менеджер (`async with uow():`).
+        """
+        if self._order_repo is None:
+            self._begin()
+        assert self._order_repo is not None
         return self._order_repo
+
+    def _begin(self) -> None:
+        """Открывает сессию и инициализирует репозитории (идемпотентно)."""
+        if self._session is None:
+            self._session = self._session_factory()
+            self._order_repo = OrderRepositoryImpl(self._session)
 
     async def __aenter__(self) -> "UnitOfWorkImpl":
         """Открывает сессию и инициализирует репозитории."""
-        self._session = self._session_factory()
-        self._order_repo = OrderRepositoryImpl(self._session)
+        self._begin()
         return self
 
     async def __aexit__(
@@ -41,6 +49,13 @@ class UnitOfWorkImpl(BaseUnitOfWork):
         if self._session:
             if exc_type is not None:
                 await self._session.rollback()
+            await self._session.close()
+        self._session = None
+        self._order_repo = None
+
+    async def close(self) -> None:
+        """Закрывает сессию без commit/rollback (для внешнего управления)."""
+        if self._session:
             await self._session.close()
         self._session = None
         self._order_repo = None

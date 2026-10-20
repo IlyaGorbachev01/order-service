@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.infrastructure.persistence.database import get_engine
+from src.presentation.api import dependencies
 from src.presentation.api.routes import orders
 from src.settings import get_settings
 
@@ -21,7 +22,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
     yield
 
-    # Очистка ресурсов при остановке (закрытие пула соединений)
+    # Очистка ресурсов при остановке
+    await dependencies.shutdown_resources()
     await engine.dispose()
 
 

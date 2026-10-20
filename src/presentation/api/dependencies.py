@@ -20,18 +20,29 @@ def _get_settings() -> Settings:
 SettingsDep = Annotated[Settings, Depends(_get_settings)]
 
 
+@lru_cache
+def _get_session_factory(settings: Settings):  # noqa: ANN202
+    """Кэширует фабрику сессий (один движок на весь жизненный цикл)."""
+    return get_session_factory(settings.database_url)
+
+
 def _get_uow(settings: SettingsDep) -> UnitOfWorkImpl:
-    """Создает Unit of Work с фабрикой сессий."""
-    session_factory = get_session_factory(settings.database_url)
-    return UnitOfWorkImpl(session_factory)
+    """Создает Unit of Work с кэшированной фабрикой сессий (на каждый запрос)."""
+    return UnitOfWorkImpl(_get_session_factory(settings))
+
+
+_catalog_client_singleton: CatalogClientImpl | None = None
 
 
 def _get_catalog_client(settings: SettingsDep) -> CatalogClientImpl:
-    """Создает клиент каталога."""
-    return CatalogClientImpl(settings)
+    """Возвращает синглтон клиента каталога (создается при первом запросе)."""
+    global _catalog_client_singleton
+    if _catalog_client_singleton is None:
+        _catalog_client_singleton = CatalogClientImpl(settings)
+    return _catalog_client_singleton
 
 
-# Зависимости уровня приложения (синглтоны на весь жизненный цикл)
+# Зависимости уровня запроса / приложения
 UowDep = Annotated[UnitOfWorkImpl, Depends(_get_uow)]
 CatalogClientDep = Annotated[CatalogClientImpl, Depends(_get_catalog_client)]
 
@@ -58,3 +69,11 @@ CreateOrderUseCaseDep = Annotated[
     CreateOrderUseCase, Depends(get_create_order_use_case)
 ]
 GetOrderUseCaseDep = Annotated[GetOrderUseCase, Depends(get_get_order_use_case)]
+
+
+async def shutdown_resources() -> None:
+    """Закрывает ресурсы инфраструктуры при остановке приложения."""
+    global _catalog_client_singleton
+    if _catalog_client_singleton is not None:
+        await _catalog_client_singleton.close()
+        _catalog_client_singleton = None

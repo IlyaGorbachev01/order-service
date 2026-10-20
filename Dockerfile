@@ -18,8 +18,6 @@ COPY run.sh ./
 # Делаем скрипт запуска исполняемым
 RUN chmod +x ./run.sh
 
-RUN chmod -R 777 /app
-
 EXPOSE 8000
 
 CMD ["bash", "./run.sh"]

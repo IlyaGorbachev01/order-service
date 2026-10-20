@@ -3,7 +3,10 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Self
 
-from src.application.ports.repositories import OrderRepository
+from src.application.ports.repositories import (
+    OrderRepository,
+    PaymentCallbackRepository,
+)
 
 
 class UnitOfWork(ABC):
@@ -16,6 +19,11 @@ class UnitOfWork(ABC):
     @abstractmethod
     def orders(self) -> OrderRepository:
         """Репозиторий заказов."""
+
+    @property
+    @abstractmethod
+    def payment_callbacks(self) -> PaymentCallbackRepository:
+        """Репозиторий обработанных callback-ов Payments Service."""
 
     @abstractmethod
     async def commit(self) -> None:

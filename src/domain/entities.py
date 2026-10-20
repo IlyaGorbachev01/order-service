@@ -14,6 +14,14 @@ class OrderStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class PaymentStatus(StrEnum):
+    """Статусы платежа Payments Service (значения совпадают с API сервиса)."""
+
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 # Разрешённые переходы состояний заказа
 ALLOWED_TRANSITIONS: dict[OrderStatus, frozenset[OrderStatus]] = {
     OrderStatus.NEW: frozenset({OrderStatus.PAID, OrderStatus.CANCELLED}),
@@ -92,7 +100,7 @@ class PaymentCallback:
 
     payment_id: str
     order_id: str
-    status: str  # "succeeded" | "failed"
+    status: PaymentStatus
     amount: str
     error_message: str | None = None
     received_at: datetime = field(default_factory=_utcnow)
@@ -100,4 +108,4 @@ class PaymentCallback:
     @property
     def succeeded(self) -> bool:
         """Успешен ли платёж по данным callback-а."""
-        return self.status == "succeeded"
+        return self.status is PaymentStatus.SUCCEEDED

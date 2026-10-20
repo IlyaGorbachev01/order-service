@@ -81,3 +81,12 @@ class CreateOrderUseCase:
 
             # 4. Сохранение и коммит
             return await uow.orders.create(order)
+
+    @staticmethod
+    def _build_payment_idempotency_key(order_id: str) -> str:
+        """Ключ идемпотентности платежа: жёстко привязан к order_id.
+
+        Повторный вызов create_payment для того же заказа не создаст
+        дубликат платежа в Payments Service (используется в Шаге 2).
+        """
+        return f"payment-{order_id}"

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.infrastructure.persistence.database import get_engine
 from src.presentation.api import dependencies
-from src.presentation.api.routes import orders
+from src.presentation.api.routes import callbacks, orders
 from src.settings import get_settings
 
 if TYPE_CHECKING:
@@ -45,6 +45,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(orders.router)
+    app.include_router(callbacks.router)
 
     return app
 

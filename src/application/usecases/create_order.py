@@ -27,21 +27,27 @@ class CreateOrderCommand:
     quantity: int
     item_id: str
     idempotency_key: str
-    callback_url: str = ""
 
 
 class CreateOrderUseCase:
-    """Use Case: создание заказа с гарантией идемпотентности."""
+    """Use Case: создание заказа с гарантией идемпотентности.
+
+    Шаги 1-2: проверка стока в Catalog Service -> сохранение заказа (NEW)
+    -> создание платежа в Payments Service с callback_url этого сервиса.
+    При сбое платежа заказ отменяется (CANCELLED).
+    """
 
     def __init__(
         self,
         uow: BaseUnitOfWork,
         catalog_client: CatalogClient,
         payments_client: PaymentsClient | None = None,
+        callback_url: str = "",
     ):
         self._uow = uow
         self._catalog_client = catalog_client
         self._payments_client = payments_client
+        self._callback_url = callback_url
 
     async def __call__(self, command: CreateOrderCommand) -> Order:
         """Выполнить сценарий создания заказа."""
@@ -96,7 +102,7 @@ class CreateOrderUseCase:
         # 5. Создание платежа — вне транзакции БД (внешний HTTP-вызов
         #    не должен держать соединение/транзакцию открытыми).
         if self._payments_client is not None:
-            order = await self._create_payment(order, amount, command.callback_url)
+            order = await self._create_payment(order, amount, self._callback_url)
 
         return order
 
@@ -112,10 +118,16 @@ class CreateOrderUseCase:
         """
         request = PaymentRequest(
             order_id=order.id,
-            amount=amount,
+            amount=amount.quantize(Decimal("0.01")),
             callback_url=callback_url,
             idempotency_key=self._build_payment_idempotency_key(order.id),
         )
+        if not callback_url:
+            logger.warning(
+                "callback_url is empty: set ORDER_SERVICE_INTERNAL_URL env var "
+                "(k8s internal host <service>.<namespace>.svc:<port>) so that "
+                "Payments Service can deliver the payment result."
+            )
         try:
             result = await self._payments_client.create_payment(request)
         except PaymentServiceError:

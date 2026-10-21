@@ -24,3 +24,17 @@ class OrderResponse(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class PaymentCallbackRequest(BaseModel):
+    """Схема callback-запроса от Payments Service."""
+
+    payment_id: str = Field(..., description="ID платежа")
+    order_id: str = Field(..., description="ID заказа")
+    status: str = Field(
+        ..., description="Итоговый статус платежа: succeeded или failed"
+    )
+    amount: str = Field(..., description="Сумма платежа")
+    error_message: str | None = Field(
+        default=None, description="Причина ошибки при неуспешном платеже"
+    )

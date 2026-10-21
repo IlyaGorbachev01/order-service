@@ -7,6 +7,7 @@ from src.domain.exceptions import (
     CatalogUnavailableError,
     InsufficientStockError,
     OrderNotFoundError,
+    PaymentServiceError,
 )
 from src.presentation.api.dependencies import CreateOrderUseCaseDep, GetOrderUseCaseDep
 from src.presentation.api.schemas import OrderCreateRequest, OrderResponse
@@ -34,6 +35,12 @@ async def create_order(
     except CatalogUnavailableError as e:
         raise HTTPException(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
+    except PaymentServiceError as e:
+        # Заказ создан, но платёж не прошёл — заказ отменён (CANCELLED),
+        # для клиента это ошибка зависимого сервиса.
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_GATEWAY, detail=str(e)
         ) from e
 
 

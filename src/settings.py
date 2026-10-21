@@ -61,9 +61,24 @@ class Settings(BaseSettings):
     )
     capashino_api_token: str = "your-api-token-here"
 
+    # Формат k8s internal DNS: <service-name>.<namespace>.svc:<порт>.
+    order_service_internal_url: str = ""
+
+    # Путь endpoint'а callback-а внутри этого сервиса
+    payment_callback_path: str = "/api/orders/payment-callback"
+
     # Приложение и инфраструктура (для будущего Шага 3)
     debug: bool = False
     kafka_bootstrap_servers: str = "kafka.kafka.svc.cluster.local:9092"
+
+    @property
+    def payment_callback_url(self) -> str:
+        """Полный внутренний URL для приёма callback-ов от Payments Service."""
+        if not self.order_service_internal_url:
+            return ""
+        return (
+            f"{self.order_service_internal_url.rstrip('/')}{self.payment_callback_path}"
+        )
 
 
 @lru_cache

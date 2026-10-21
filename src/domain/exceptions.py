@@ -28,3 +28,14 @@ class InvalidOrderTransitionError(OrderError):
 
 class DuplicatePaymentCallbackError(OrderError):
     """Callback с таким payment_id уже был обработан (идемпотентность)."""
+
+
+class ConcurrentOrderCreationError(OrderError):
+    """Конкурентная попытка создать заказ с тем же idempotency_key.
+
+    Возникает, когда несколько запросов (или несколько реплик сервиса)
+    одновременно проходят проверку «заказа ещё нет» и затем сталкиваются
+    на уникальном индексе `orders.idempotency_key`. Отрабатывается как
+    штатная ситуация: use case повторяет чтение и возвращает уже
+    существующий заказ (идемпотентность).
+    """

@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from src.application.usecases.create_order import CreateOrderCommand
 from src.domain.exceptions import (
     CatalogUnavailableError,
+    ConcurrentOrderCreationError,
     InsufficientStockError,
     OrderNotFoundError,
     PaymentServiceError,
@@ -20,7 +21,12 @@ async def create_order(
     request: OrderCreateRequest,
     use_case: CreateOrderUseCaseDep,
 ) -> OrderResponse:
-    """Создает новый заказ."""
+    """Создает новый заказ.
+
+    Идемпотентность: повторный запрос с тем же idempotency_key возвращает
+    тот же заказ (201). Если параллельный запрос не успел зафиксировать
+    заказ — отдаём 503 (клиент/тест может повторить запрос), но не 500.
+    """
     try:
         command = CreateOrderCommand(
             user_id=request.user_id,
@@ -35,6 +41,14 @@ async def create_order(
     except CatalogUnavailableError as e:
         raise HTTPException(
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY, detail=str(e)
+        ) from e
+    except ConcurrentOrderCreationError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            detail=(
+                "Заказ с таким idempotency_key создаётся параллельным запросом, "
+                "повторите попытку."
+            ),
         ) from e
     except PaymentServiceError as e:
         # Заказ создан, но платёж не прошёл — заказ отменён (CANCELLED),

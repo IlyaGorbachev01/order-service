@@ -8,10 +8,31 @@ from src.application.ports.repositories import (
 )
 from src.domain.entities import Order, OrderStatus, PaymentCallback
 from src.domain.exceptions import (
+    ConcurrentOrderCreationError,
     DuplicatePaymentCallbackError,
     OrderNotFoundError,
 )
 from src.infrastructure.persistence.models import OrderModel, PaymentCallbackModel
+
+
+def _is_unique_violation(error: IntegrityError) -> bool:
+    """Проверяет, что IntegrityError вызван нарушением unique-ограничения.
+
+    Работает для PostgreSQL (asyncpg/psycopg), SQLite и SQL Server, где код
+    ошибки отличается; для остальных случаев используется общий признак
+    SQLAlchemy — «duplicate key / UNIQUE constraint failed».
+    """
+    pgcode = getattr(error.orig, "pgcode", None) or getattr(
+        error.orig, "sqlstate", None
+    )
+    if pgcode == "23505":  # PostgreSQL unique_violation
+        return True
+    message = str(error).lower()
+    return (
+        "unique" in message
+        or "duplicate key" in message
+        or "constraint failed" in message
+    )
 
 
 class OrderRepositoryImpl(OrderRepository):
@@ -42,7 +63,13 @@ class OrderRepositoryImpl(OrderRepository):
         return self._to_entity(model) if model else None
 
     async def create(self, order: Order) -> Order:
-        """Добавить заказ в сессию и выполнить flush."""
+        """Добавить заказ в сессию и выполнить flush.
+
+        Гонка двух запросов с одинаковым `idempotency_key` приводит к
+        нарушению уникального индекса. Такое состояние переводится в
+        доменное `ConcurrentOrderCreationError`, чтобы use case смог
+        вернуться к существующему заказу, а не отдать клиенту 500.
+        """
         model = OrderModel(
             id=order.id,
             user_id=order.user_id,
@@ -56,7 +83,15 @@ class OrderRepositoryImpl(OrderRepository):
             updated_at=order.updated_at,
         )
         self._session.add(model)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as e:
+            if _is_unique_violation(e):
+                raise ConcurrentOrderCreationError(
+                    f"Заказ с idempotency_key={order.idempotency_key} "
+                    f"уже создаётся конкурентным запросом."
+                ) from e
+            raise
         return order
 
     async def update(self, order: Order) -> Order:
@@ -123,6 +158,8 @@ class PaymentCallbackRepositoryImpl(PaymentCallbackRepository):
         try:
             await self._session.flush()
         except IntegrityError as e:
-            raise DuplicatePaymentCallbackError(
-                f"Callback для платежа {callback.payment_id} уже обработан."
-            ) from e
+            if _is_unique_violation(e):
+                raise DuplicatePaymentCallbackError(
+                    f"Callback для платежа {callback.payment_id} уже обработан."
+                ) from e
+            raise

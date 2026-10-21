@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.application.usecases.create_order import CreateOrderUseCase
 from src.application.usecases.get_order import GetOrderUseCase
@@ -23,11 +24,19 @@ def _get_settings() -> Settings:
 
 SettingsDep = Annotated[Settings, Depends(_get_settings)]
 
+_session_factory_singleton = None
 
-@lru_cache
-def _get_session_factory(settings: Settings):  # noqa: ANN202
-    """Кэширует фабрику сессий (один движок на весь жизненный цикл)."""
-    return get_session_factory(settings.database_url)
+
+def _get_session_factory(settings: Settings) -> async_sessionmaker[AsyncSession]:
+    """Кэширует фабрику сессий (один движок на весь жизненный цикл).
+
+    Примечание: lru_cache здесь не используется, т.к. pydantic-модель
+    Settings не хешируется (unhashable type: 'Settings').
+    """
+    global _session_factory_singleton
+    if _session_factory_singleton is None:
+        _session_factory_singleton = get_session_factory(settings.database_url)
+    return _session_factory_singleton
 
 
 def _get_uow(settings: SettingsDep) -> UnitOfWorkImpl:

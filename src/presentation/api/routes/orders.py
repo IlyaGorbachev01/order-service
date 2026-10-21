@@ -39,9 +39,7 @@ async def create_order(
     except PaymentServiceError as e:
         # Заказ создан, но платёж не прошёл — заказ отменён (CANCELLED),
         # для клиента это ошибка зависимого сервиса.
-        raise HTTPException(
-            status_code=HTTPStatus.BAD_GATEWAY, detail=str(e)
-        ) from e
+        raise HTTPException(status_code=HTTPStatus.BAD_GATEWAY, detail=str(e)) from e
 
 
 @router.get("/{order_id}", status_code=HTTPStatus.OK, response_model=OrderResponse)

@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from src.domain.entities import OrderStatus
+from src.domain.entities import Order
+from src.domain.notifications import notification_idempotency_key, notification_message
 
 
 @dataclass(frozen=True)
@@ -11,6 +12,21 @@ class NotificationRequest:
     message: str
     reference_id: str  # order_id, к которому относится уведомление
     idempotency_key: str  # предотвращает дублирование уведомлений
+
+
+def build_status_notification(order: Order) -> NotificationRequest:
+    """Собрать уведомление о текущем статусе заказа (домен + контракт API).
+
+    Текст берётся из domain-маппинга (`src/domain/notifications.py`), для
+    CANCELLED используется причина отмены заказа. Ключ идемпотентности
+    детерминирован (`{order_id}:{status}`), поэтому повторная обработка
+    того же перехода не создаёт дубликат уведомления.
+    """
+    return NotificationRequest(
+        message=notification_message(order.status, reason=order.cancel_reason),
+        reference_id=order.id,
+        idempotency_key=notification_idempotency_key(order.id, order.status),
+    )
 
 
 class NotificationClient(ABC):
@@ -32,12 +48,3 @@ class NotificationClient(ABC):
         Идемпотентность обеспечивается полем `idempotency_key`: повторная
         отправка с тем же ключом не создаёт дубликат уведомления.
         """
-
-
-def notification_idempotency_key(order_id: str, status: OrderStatus) -> str:
-    """Детерминированный ключ идемпотентности для уведомления о статусе.
-
-    Один заказ + один статус = ровно одно уведомление, даже если
-    обработчик (callback / Kafka-событие) выполнится несколько раз.
-    """
-    return f"{order_id}:{status.value}"

@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from http import HTTPStatus
 
 import httpx
 
@@ -16,6 +17,7 @@ from src.domain.exceptions import (
     CatalogUnavailableError,
     ConcurrentOrderCreationError,
     InsufficientStockError,
+    ItemNotFoundError,
     PaymentServiceError,
 )
 
@@ -160,7 +162,7 @@ class CreateOrderUseCase:
             #    Нарушение unique по idempotency_key бросает
             #    ConcurrentOrderCreationError -> повтор в _create_order.
             created = await uow.orders.create(order)
-            return created, True
+            return order, created
 
     async def _find_existing(self, idempotency_key: str) -> Order | None:
         """Прочитать заказ, созданный конкурентным запросом."""
@@ -168,15 +170,25 @@ class CreateOrderUseCase:
             return await uow.orders.get_by_idempotency_key(idempotency_key)
 
     async def _get_catalog_item(self, item_id: str) -> CatalogItem:
-        """Получить товар из Catalog Service, переводя ошибки в доменные."""
+        """Получить товар из Catalog Service, переводя ошибки в доменные.
+
+        404 от каталога — это «товара нет», штатная бизнес-ситуация:
+        транслируется в ItemNotFoundError (роут отдаёт 400). Прочие
+        HTTP-ошибки и сетевые сбои — CatalogUnavailableError (422/502),
+        но никак не 500 Internal Server Error.
+        """
         try:
             return await self._catalog_client.get_item(item_id)
         except httpx.HTTPStatusError as e:
-            logger.warning(
-                "Catalog error for item %s: %s", item_id, e.response.status_code
-            )
+            status_code = e.response.status_code
+            logger.warning("Catalog error for item %s: HTTP %s", item_id, status_code)
+            if status_code == HTTPStatus.NOT_FOUND:
+                raise ItemNotFoundError(
+                    f"Товар {item_id} не найден в каталоге."
+                ) from e
             raise CatalogUnavailableError(
-                f"Товар {item_id} не найден в каталоге (HTTP {e.response.status_code})."
+                f"Catalog Service вернул ошибку HTTP {status_code} "
+                f"для товара {item_id}."
             ) from e
         except httpx.HTTPError as e:
             logger.warning("Catalog service unavailable: %s", e)

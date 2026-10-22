@@ -80,13 +80,22 @@ class OrderRepositoryImpl(OrderRepository):
         model = result.scalar_one_or_none()
         return self._to_entity(model) if model else None
 
-    async def create(self, order: Order) -> Order:
+    async def create(self, order: Order) -> bool:
         """Добавить заказ в сессию и выполнить flush.
+
+        Возвращает True, если заказ создан этим вызовом, и False, если
+        заказ с таким `idempotency_key` уже существует (идемпотентный
+        повтор).
 
         Гонка двух запросов с одинаковым `idempotency_key` приводит к
         нарушению уникального индекса. Такое состояние переводится в
         доменное `ConcurrentOrderCreationError`, чтобы use case смог
         вернуться к существующему заказу, а не отдать клиенту 500.
+
+        Важно: после IntegrityError сессия становится «грязной» (все
+        последующие операции падают с PendingRollbackError), поэтому её
+        немедленно откатываем — иначе повторное чтение существующего
+        заказа в той же транзакции давало бы 500 Internal Server Error.
         """
         model = OrderModel(
             id=order.id,
@@ -104,13 +113,16 @@ class OrderRepositoryImpl(OrderRepository):
         try:
             await self._session.flush()
         except IntegrityError as e:
+            # Откатываем сессию, чтобы она снова стала пригодна для
+            # работы (иначе UoW.rollback() тоже упадёт поверх ошибки).
+            await self._session.rollback()
             if _is_unique_violation(e):
                 raise ConcurrentOrderCreationError(
                     f"Заказ с idempotency_key={order.idempotency_key} "
                     f"уже создаётся конкурентным запросом."
                 ) from e
             raise
-        return order
+        return True
 
     async def update(self, order: Order) -> Order:
         """Сохранить изменения существующего заказа (статус, payment_id и т.п.)."""

@@ -7,6 +7,7 @@ from src.domain.exceptions import (
     CatalogUnavailableError,
     ConcurrentOrderCreationError,
     InsufficientStockError,
+    ItemNotFoundError,
     OrderNotFoundError,
     PaymentServiceError,
 )
@@ -36,7 +37,8 @@ async def create_order(
         )
         order = await use_case(command)
         return OrderResponse.model_validate(order)
-    except InsufficientStockError as e:
+    except (InsufficientStockError, ItemNotFoundError) as e:
+        # Товар отсутствует или его недостаточно — бизнес-ошибка клиента.
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(e)) from e
     except CatalogUnavailableError as e:
         raise HTTPException(

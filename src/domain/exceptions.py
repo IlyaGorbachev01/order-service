@@ -15,7 +15,15 @@ class DuplicateOrderError(OrderError):
 
 
 class CatalogUnavailableError(OrderError):
-    """Товар не найден в каталоге или Catalog Service недоступен."""
+    """Catalog Service недоступен (сетевая ошибка, 5xx и т.п.)."""
+
+
+class ItemNotFoundError(OrderError):
+    """Товар не найден в каталоге (Catalog Service вернул 404).
+
+    Для клиента это то же самое, что «товара нет в наличии»: заказ
+    создать нельзя, отдаём 400 Bad Request (а не 500).
+    """
 
 
 class PaymentServiceError(OrderError):

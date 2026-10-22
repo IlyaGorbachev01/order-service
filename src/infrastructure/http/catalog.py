@@ -12,7 +12,7 @@ class CatalogClientImpl(CatalogClient):
     def __init__(self, settings: Settings):
         self._base_url = settings.capashino_internal_url
         self._api_key = settings.capashino_api_token
-        self._client = httpx.AsyncClient(timeout=10.0)
+        self._client = httpx.AsyncClient(timeout=settings.http_timeout)
 
     async def get_item(self, item_id: str) -> CatalogItem:
         """Получает товар из каталога по идентификатору."""

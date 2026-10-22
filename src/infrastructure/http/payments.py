@@ -21,7 +21,7 @@ class PaymentsClientImpl(PaymentsClient):
     def __init__(self, settings: Settings):
         self._base_url = settings.capashino_internal_url
         self._api_key = settings.capashino_api_token
-        self._client = httpx.AsyncClient(timeout=10.0)
+        self._client = httpx.AsyncClient(timeout=settings.http_timeout)
 
     async def create_payment(self, request: PaymentRequest) -> PaymentResult:
         """Создать платёж через POST /api/payments.

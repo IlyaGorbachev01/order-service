@@ -55,11 +55,22 @@ class Settings(BaseSettings):
     # База данных: приоритет у явного DATABASE_URL, иначе сборка из POSTGRES_*
     database_url: str = _default_database_url()
 
-    # Capashino API
+    # Capashino API (Catalog / Payments)
     capashino_internal_url: str = (
         "http://student-system-capashino-web.student-system-capashino.svc:8000"
     )
     capashino_api_token: str = "your-api-token-here"
+
+    # Notifications Service
+    notifications_base_url: str = (
+        "http://student-system-capashino-web.student-system-capashino.svc:8000"
+    )
+    # Токен для Notifications Service; если не задан — используется
+    # capashino_api_token (единый ключ для всех сервисов Capashino).
+    notifications_api_token: str = ""
+
+    # HTTP-таймаут для вызовов внешних сервисов, сек.
+    http_timeout: float = 10.0
 
     # Формат k8s internal DNS: <service-name>.<namespace>.svc:<порт>.
     order_service_internal_url: str = ""
@@ -88,6 +99,15 @@ class Settings(BaseSettings):
             return ""
         base = self.order_service_internal_url.rstrip("/")
         return f"{base}{self.payment_callback_path}"
+
+    @property
+    def notifications_api_key(self) -> str:
+        """Токен для Notifications Service.
+
+        Если NOTIFICATIONS_API_TOKEN не задан, используется общий токен
+        Capashino (X-API-Key одинаков для всех сервисов портала).
+        """
+        return self.notifications_api_token or self.capashino_api_token
 
 
 @lru_cache

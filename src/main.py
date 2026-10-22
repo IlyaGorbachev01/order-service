@@ -20,6 +20,10 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     settings = get_settings()
     engine: AsyncEngine = get_engine(settings.database_url)
 
+    # Kafka-компоненты Шага 3: publisher, outbox-воркер, consumer событий
+    # Shipping Service. Сбой брокера не валит HTTP-сервис (см. зависимости).
+    await dependencies.start_background_components()
+
     yield
 
     # Очистка ресурсов при остановке

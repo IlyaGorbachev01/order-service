@@ -74,8 +74,12 @@ class Order:
         if payment_id is not None:
             self.payment_id = payment_id
 
+    def mark_shipped(self) -> None:
+        """Заказ отправлен в доставку (событие `order.shipped`): PAID -> SHIPPED."""
+        self.transition_to(OrderStatus.SHIPPED)
+
     def mark_cancelled(self, reason: str | None = None) -> None:
-        """Отмена заказа (неуспешный платёж, нехватка стока и т.п.)."""
+        """Отмена заказа (неудачный платёж, нехватка стока, событие отмены)."""
         self.transition_to(OrderStatus.CANCELLED)
         if reason:
             self.cancel_reason = reason

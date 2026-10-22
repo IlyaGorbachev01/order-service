@@ -67,18 +67,27 @@ class Settings(BaseSettings):
     # Путь endpoint'а callback-а внутри этого сервиса
     payment_callback_path: str = "/api/orders/payment-callback"
 
-    # Приложение и инфраструктура (для будущего Шага 3)
+    # Приложение
     debug: bool = False
+
+    # Kafka: интеграция с Shipping Service через события.
     kafka_bootstrap_servers: str = "kafka.kafka.svc.cluster.local:9092"
+    # Consumer group Order Service для событий от Shipping Service
+    kafka_consumer_group_id: str = "order-service"
+    # Топик исходящих событий Order Service (order.paid)
+    order_events_topic: str = "student_system-order.events"
+    # Топик входящих событий Shipping Service (order.shipped / order.cancelled)
+    shipment_events_topic: str = "student_system-shipment.events"
+    # Интервал опроса outbox-таблицы публикатором, сек.
+    outbox_poll_interval: float = 1.0
 
     @property
     def payment_callback_url(self) -> str:
         """Полный внутренний URL для приёма callback-ов от Payments Service."""
         if not self.order_service_internal_url:
             return ""
-        return (
-            f"{self.order_service_internal_url.rstrip('/')}{self.payment_callback_path}"
-        )
+        base = self.order_service_internal_url.rstrip("/")
+        return f"{base}{self.payment_callback_path}"
 
 
 @lru_cache

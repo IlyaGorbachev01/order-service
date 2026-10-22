@@ -1,6 +1,5 @@
 import logging
 
-from src.application.ports.notifications import NotificationClient
 from src.application.ports.repositories import OutboxRepository
 from src.application.ports.uow import BaseUnitOfWork
 from src.application.usecases.notify_order_status import OrderNotifier
@@ -86,11 +85,12 @@ class ProcessPaymentCallbackUseCase:
         uow: BaseUnitOfWork,
         *,
         order_events_topic: str = "",
-        notifications_client: NotificationClient | None = None,
+        notifier: OrderNotifier | None = None,
     ):
         self._uow = uow
         self._order_events_topic = order_events_topic
-        self._notifier = OrderNotifier(notifications_client)
+        # Общий синглтонный нотификатор (см. NotificationDispatcher).
+        self._notifier = notifier if notifier is not None else OrderNotifier()
 
     async def __call__(self, callback: PaymentCallback) -> None:
         """Обработать callback платежа.
@@ -179,4 +179,4 @@ class ProcessPaymentCallbackUseCase:
         # Уведомление о новом статусе (PAID/CANCELLED) — после коммита
         # транзакции, чтобы не отправлять уведомление при последующем откате.
         # OrderNotifier перехватывает ошибки сервиса и лишь логирует их.
-        await self._notifier.notify(order)
+        self._notifier.notify(order)

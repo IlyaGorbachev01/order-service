@@ -1,6 +1,5 @@
 import logging
 
-from src.application.ports.notifications import NotificationClient
 from src.application.ports.uow import BaseUnitOfWork
 from src.application.usecases.notify_order_status import OrderNotifier
 from src.domain.events import ShipmentReceivedEvent
@@ -38,10 +37,11 @@ class HandleShipmentEventUseCase:
     def __init__(
         self,
         uow: BaseUnitOfWork,
-        notifications_client: NotificationClient | None = None,
+        notifier: OrderNotifier | None = None,
     ):
         self._uow = uow
-        self._notifier = OrderNotifier(notifications_client)
+        # Общий синглтонный нотификатор
+        self._notifier = notifier if notifier is not None else OrderNotifier()
 
     async def __call__(self, event: ShipmentReceivedEvent) -> None:
         """Обработать событие доставки.
@@ -124,4 +124,4 @@ class HandleShipmentEventUseCase:
         # Уведомление о новом статусе (SHIPPED/CANCELLED) — после
         # коммита транзакции. Ошибки Notifications Service логируются
         # внутри OrderNotifier и не прерывают обработку события консьюмером.
-        await self._notifier.notify(order)
+        self._notifier.notify(order)

@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.application.usecases.create_order import CreateOrderUseCase
 from src.application.usecases.get_order import GetOrderUseCase
 from src.application.usecases.handle_shipment_event import HandleShipmentEventUseCase
+from src.application.usecases.notification_dispatcher import NotificationDispatcher
+from src.application.usecases.notify_order_status import OrderNotifier
 from src.application.usecases.process_payment_callback import (
     ProcessPaymentCallbackUseCase,
 )
@@ -95,6 +97,33 @@ NotificationsClientDep = Annotated[
 ]
 
 
+# --- Диспетчер уведомлений (синглтон уровня приложения) ---
+# Все use case'ы используют ОДИН OrderNotifier: фоновые задачи отправки
+# уведомлений переживают завершение HTTP-запроса и не теряются при сборке
+# мусора; при остановке приложения ожидаем их завершения (shutdown_resources).
+
+_notification_dispatcher_singleton: NotificationDispatcher | None = None
+
+
+def _get_notification_dispatcher(settings: SettingsDep) -> NotificationDispatcher:
+    global _notification_dispatcher_singleton
+    if _notification_dispatcher_singleton is None:
+        _notification_dispatcher_singleton = NotificationDispatcher(
+            _get_notifications_client(settings)
+        )
+    return _notification_dispatcher_singleton
+
+
+NotificationDispatcherDep = Annotated[
+    NotificationDispatcher, Depends(_get_notification_dispatcher)
+]
+
+
+def get_order_notifier() -> OrderNotifier:
+    """Синглтонный нотификатор для фонового консьюмера (вне HTTP-запроса)."""
+    return _get_notification_dispatcher(_get_settings()).notifier
+
+
 # --- Фабрики use case'ов ---
 
 
@@ -102,7 +131,7 @@ def get_create_order_use_case(
     uow: UowDep,
     catalog_client: CatalogClientDep,
     payments_client: PaymentsClientDep,
-    notifications_client: NotificationsClientDep,
+    dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
 ) -> CreateOrderUseCase:
     """Создает сценарий оформления заказа (оплата + уведомления)."""
@@ -111,7 +140,7 @@ def get_create_order_use_case(
         catalog_client,
         payments_client=payments_client,
         callback_url=settings.payment_callback_url,
-        notifications_client=notifications_client,
+        notifier=dispatcher.notifier,
     )
 
 
@@ -124,14 +153,14 @@ def get_get_order_use_case(
 
 def get_process_payment_callback_use_case(
     uow: UowDep,
-    notifications_client: NotificationsClientDep,
+    dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
 ) -> ProcessPaymentCallbackUseCase:
     """Создает сценарий обработки callback-а от Payments Service."""
     return ProcessPaymentCallbackUseCase(
         uow,
         order_events_topic=settings.order_events_topic,
-        notifications_client=notifications_client,
+        notifier=dispatcher.notifier,
     )
 
 
@@ -171,7 +200,7 @@ async def handle_shipment_event(event: ShipmentReceivedEvent) -> None:
     uow = UnitOfWorkImpl(_get_session_factory(settings))
     use_case = HandleShipmentEventUseCase(
         uow,
-        notifications_client=_get_notifications_client(settings),
+        notifier=get_order_notifier(),
     )
     await use_case(event)
 
@@ -221,6 +250,12 @@ async def shutdown_resources() -> None:
     global _notifications_client_singleton
     global _kafka_publisher_singleton, _outbox_worker_singleton
     global _shipment_consumer_singleton
+    global _notification_dispatcher_singleton
+    # Сначала дожидаемся фоновых отправок уведомлений — они используют
+    # HTTP-клиент Notifications Service, который закрывается ниже.
+    if _notification_dispatcher_singleton is not None:
+        await _notification_dispatcher_singleton.wait_pending()
+        _notification_dispatcher_singleton = None
     if _shipment_consumer_singleton is not None:
         await _shipment_consumer_singleton.stop()
         _shipment_consumer_singleton = None

@@ -22,6 +22,14 @@ class PaymentServiceError(OrderError):
     """Payments Service недоступен или отклонил создание платежа."""
 
 
+class NotificationServiceError(OrderError):
+    """Notifications Service недоступен или вернул ошибку HTTP.
+
+    Не блокирует основной процесс: use cases перехватывают это исключение
+    и лишь логируют его.
+    """
+
+
 class InvalidOrderTransitionError(OrderError):
     """Запрещённый переход статуса заказа (нарушение машины состояний)."""
 

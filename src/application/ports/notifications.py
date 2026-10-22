@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from src.domain.entities import Order
-from src.domain.notifications import notification_idempotency_key, notification_message
+from src.domain.notifications import notification_idempotency_key, notification_message  # type: ignore
 
 
 @dataclass(frozen=True)

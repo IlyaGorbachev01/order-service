@@ -13,6 +13,7 @@ from src.application.usecases.process_payment_callback import (
 )
 from src.domain.events import ShipmentReceivedEvent
 from src.infrastructure.http.catalog import CatalogClientImpl
+from src.infrastructure.http.notifications import NotificationsClientImpl
 from src.infrastructure.http.payments import PaymentsClientImpl
 from src.infrastructure.messaging.kafka import KafkaEventPublisher, ShipmentConsumer
 from src.infrastructure.messaging.outbox_worker import OutboxWorker
@@ -74,10 +75,24 @@ def _get_payments_client(settings: SettingsDep) -> PaymentsClientImpl:
     return _payments_client_singleton
 
 
+_notifications_client_singleton: NotificationsClientImpl | None = None
+
+
+def _get_notifications_client(settings: SettingsDep) -> NotificationsClientImpl:
+    """Возвращает синглтон клиента Notifications Service (Шаг 4)."""
+    global _notifications_client_singleton
+    if _notifications_client_singleton is None:
+        _notifications_client_singleton = NotificationsClientImpl(settings)
+    return _notifications_client_singleton
+
+
 # Зависимости уровня запроса / приложения
 UowDep = Annotated[UnitOfWorkImpl, Depends(_get_uow)]
 CatalogClientDep = Annotated[CatalogClientImpl, Depends(_get_catalog_client)]
 PaymentsClientDep = Annotated[PaymentsClientImpl, Depends(_get_payments_client)]
+NotificationsClientDep = Annotated[
+    NotificationsClientImpl, Depends(_get_notifications_client)
+]
 
 
 # --- Фабрики use case'ов ---
@@ -87,14 +102,16 @@ def get_create_order_use_case(
     uow: UowDep,
     catalog_client: CatalogClientDep,
     payments_client: PaymentsClientDep,
+    notifications_client: NotificationsClientDep,
     settings: SettingsDep,
 ) -> CreateOrderUseCase:
-    """Создает сценарий оформления заказа (с оплатой через Payments Service)."""
+    """Создает сценарий оформления заказа (оплата + уведомления)."""
     return CreateOrderUseCase(
         uow,
         catalog_client,
         payments_client=payments_client,
         callback_url=settings.payment_callback_url,
+        notifications_client=notifications_client,
     )
 
 
@@ -107,12 +124,14 @@ def get_get_order_use_case(
 
 def get_process_payment_callback_use_case(
     uow: UowDep,
+    notifications_client: NotificationsClientDep,
     settings: SettingsDep,
 ) -> ProcessPaymentCallbackUseCase:
     """Создает сценарий обработки callback-а от Payments Service."""
     return ProcessPaymentCallbackUseCase(
         uow,
         order_events_topic=settings.order_events_topic,
+        notifications_client=notifications_client,
     )
 
 
@@ -150,7 +169,10 @@ async def handle_shipment_event(event: ShipmentReceivedEvent) -> None:
     """
     settings = _get_settings()
     uow = UnitOfWorkImpl(_get_session_factory(settings))
-    use_case = HandleShipmentEventUseCase(uow)
+    use_case = HandleShipmentEventUseCase(
+        uow,
+        notifications_client=_get_notifications_client(settings),
+    )
     await use_case(event)
 
 
@@ -196,6 +218,7 @@ async def start_background_components() -> None:
 async def shutdown_resources() -> None:
     """Закрывает ресурсы инфраструктуры при остановке приложения."""
     global _catalog_client_singleton, _payments_client_singleton
+    global _notifications_client_singleton
     global _kafka_publisher_singleton, _outbox_worker_singleton
     global _shipment_consumer_singleton
     if _shipment_consumer_singleton is not None:
@@ -213,3 +236,6 @@ async def shutdown_resources() -> None:
     if _payments_client_singleton is not None:
         await _payments_client_singleton.close()
         _payments_client_singleton = None
+    if _notifications_client_singleton is not None:
+        await _notifications_client_singleton.close()
+        _notifications_client_singleton = None

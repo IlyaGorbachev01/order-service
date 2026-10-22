@@ -1,7 +1,9 @@
 import logging
 
+from src.application.ports.notifications import NotificationClient
 from src.application.ports.repositories import OutboxRepository
 from src.application.ports.uow import BaseUnitOfWork
+from src.application.usecases.notify_order_status import OrderNotifier
 from src.domain.entities import PaymentCallback
 from src.domain.events import ORDER_PAID_EVENT, OrderPaidEvent
 from src.domain.exceptions import (
@@ -79,9 +81,16 @@ class ProcessPaymentCallbackUseCase:
     - status == failed    -> заказ переходит в CANCELLED.
     """
 
-    def __init__(self, uow: BaseUnitOfWork, *, order_events_topic: str = ""):
+    def __init__(
+        self,
+        uow: BaseUnitOfWork,
+        *,
+        order_events_topic: str = "",
+        notifications_client: NotificationClient | None = None,
+    ):
         self._uow = uow
         self._order_events_topic = order_events_topic
+        self._notifier = OrderNotifier(notifications_client)
 
     async def __call__(self, callback: PaymentCallback) -> None:
         """Обработать callback платежа.
@@ -166,3 +175,8 @@ class ProcessPaymentCallbackUseCase:
                 order.status.value,
                 callback.payment_id,
             )
+
+        # Уведомление о новом статусе (PAID/CANCELLED) — после коммита
+        # транзакции, чтобы не отправлять уведомление при последующем откате.
+        # OrderNotifier перехватывает ошибки сервиса и лишь логирует их.
+        await self._notifier.notify(order)

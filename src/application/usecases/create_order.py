@@ -8,8 +8,10 @@ from decimal import Decimal
 import httpx
 
 from src.application.ports.catalog import CatalogClient, CatalogItem
+from src.application.ports.notifications import NotificationClient
 from src.application.ports.payments import PaymentRequest, PaymentsClient
 from src.application.ports.uow import BaseUnitOfWork
+from src.application.usecases.notify_order_status import OrderNotifier
 from src.domain.entities import Order, OrderStatus, PaymentStatus
 from src.domain.exceptions import (
     CatalogUnavailableError,
@@ -55,20 +57,27 @@ class CreateOrderUseCase:
         catalog_client: CatalogClient,
         payments_client: PaymentsClient | None = None,
         callback_url: str = "",
+        notifications_client: NotificationClient | None = None,
     ):
         self._uow = uow
         self._catalog_client = catalog_client
         self._payments_client = payments_client
         self._callback_url = callback_url
+        self._notifier = OrderNotifier(notifications_client)
 
     async def __call__(self, command: CreateOrderCommand) -> Order:
         """Выполнить сценарий создания заказа."""
         order, created = await self._create_order(command)
-        # Платёж создаём только для нового заказа: повторный запрос с тем же
-        # idempotency_key возвращает исходный заказ без побочных эффектов.
-        if created and self._payments_client is not None:
-            amount = await self._resolve_amount(order)
-            order = await self._create_payment(order, amount, self._callback_url)
+        if created:
+            # Уведомление о создании заказа (NEW). Отправляется только
+            # для нового заказа — повторный идемпотентный запрос не дублирует
+            # уведомления (плюс детерминированный ключ {order_id}:{status}).
+            await self._notifier.notify(order)
+            # Платёж создаём только для нового заказа: повторный запрос с тем же
+            # idempotency_key возвращает исходный заказ без побочных эффектов.
+            if self._payments_client is not None:
+                amount = await self._resolve_amount(order)
+                order = await self._create_payment(order, amount, self._callback_url)
         return order
 
     async def _create_order(self, command: CreateOrderCommand) -> tuple[Order, bool]:
@@ -193,6 +202,9 @@ class CreateOrderUseCase:
             callback_url=callback_url,
             idempotency_key=self._build_payment_idempotency_key(order.id),
         )
+        # Платёжный клиент обязателен: __call__ вызывает _create_payment
+        # только когда self._payments_client is not None.
+        assert self._payments_client is not None
         if not callback_url:
             logger.warning(
                 "callback_url is empty: set ORDER_SERVICE_INTERNAL_URL env var "
@@ -230,6 +242,10 @@ class CreateOrderUseCase:
                 result.id,
                 updated.status.value,
             )
+            # Уведомление о синхронном итоге платежа (PAID/CANCELLED).
+            # Для PENDING итог придёт на callback и будет отправлен там.
+            if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
+                await self._notifier.notify(updated)
             return updated
 
     async def _cancel_order(self, order_id: str, reason: str) -> None:
@@ -242,8 +258,10 @@ class CreateOrderUseCase:
             ):
                 return
             order.mark_cancelled(reason=reason)
-            await uow.orders.update(order)
+            updated = await uow.orders.update(order)
             logger.info("Order %s cancelled: %s", order_id, reason)
+            # Уведомление об отмене заказа (CANCELLED).
+            await self._notifier.notify(updated)
 
     @staticmethod
     def _build_payment_idempotency_key(order_id: str) -> str:

@@ -4,7 +4,9 @@ from contextlib import asynccontextmanager
 from typing import Self
 
 from src.application.ports.repositories import (
+    InboxRepository,
     OrderRepository,
+    OutboxRepository,
     PaymentCallbackRepository,
 )
 
@@ -24,6 +26,16 @@ class UnitOfWork(ABC):
     @abstractmethod
     def payment_callbacks(self) -> PaymentCallbackRepository:
         """Репозиторий обработанных callback-ов Payments Service."""
+
+    @property
+    @abstractmethod
+    def outbox(self) -> OutboxRepository:
+        """Репозиторий исходящих событий (Outbox-паттерн)."""
+
+    @property
+    @abstractmethod
+    def inbox(self) -> InboxRepository:
+        """Репозиторий обработанных входящих событий (Inbox-паттерн)."""
 
     @abstractmethod
     async def commit(self) -> None:

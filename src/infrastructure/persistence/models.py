@@ -1,6 +1,7 @@
+import json
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -49,5 +50,53 @@ class PaymentCallbackModel(Base):
     amount: Mapped[str] = mapped_column(String(32), nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class OutboxEventModel(Base):
+    """ORM-модель таблицы Outbox (исходящие события в Kafka).
+
+    Событие пишется в ту же транзакцию, что и изменение заказа, — так
+    гарантируется атомарность «данные + событие» (Outbox-паттерн).
+    Отдельный воркер выбирает записи с `published = FALSE` и публикует их
+    в брокер, после чего помечает отправленными.
+    """
+
+    __tablename__ = "outbox_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    def payload_dict(self) -> dict:
+        """Десериализовать JSON-строку payload'а в словарь."""
+        return json.loads(self.payload)
+
+
+class InboxEventModel(Base):
+    """ORM-модель таблицы Inbox (обработанные входящие события из Kafka).
+
+    Уникальный индекс по `event_id` обеспечивает идемпотентность: повторная
+    доставка того же события (at-least-once семантика Kafka) не пройдёт
+    вставку (IntegrityError) и будет корректно пропущена консьюмером.
+    """
+
+    __tablename__ = "inbox_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

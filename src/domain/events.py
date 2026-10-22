@@ -78,6 +78,20 @@ class ShipmentReceivedEvent(DomainEvent):
         """Событие означает отмену доставки (заказ должен быть отменён)."""
         return self.event_type == ShipmentEventType.CANCELLED
 
+    def to_payload(self) -> dict:
+        """Сериализация события обратно в JSON-формат топика (для Inbox)."""
+        payload = {
+            "event_type": self.event_type,
+            "order_id": self.order_id,
+            "item_id": self.item_id,
+            "quantity": self.quantity,
+        }
+        if self.shipment_id is not None:
+            payload["shipment_id"] = self.shipment_id
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        return payload
+
     @classmethod
     def from_payload(
         cls,

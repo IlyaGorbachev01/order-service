@@ -30,6 +30,14 @@ class DuplicatePaymentCallbackError(OrderError):
     """Callback с таким payment_id уже был обработан (идемпотентность)."""
 
 
+class DuplicateInboxEventError(Exception):
+    """Входящее событие с таким event_id уже обработано (Inbox-паттерн).
+
+    Не является ошибкой заказа: сигнал штатной дедупликации повторной
+    доставки события из Kafka (at-least-once семантика брокера).
+    """
+
+
 class ConcurrentOrderCreationError(OrderError):
     """Конкурентная попытка создать заказ с тем же idempotency_key.
 

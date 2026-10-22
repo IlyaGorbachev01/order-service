@@ -1,18 +1,32 @@
-from sqlalchemy import select
+import json
+from collections.abc import Sequence
+from datetime import UTC, datetime
+
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.application.ports.repositories import (
+    InboxRepository,
     OrderRepository,
+    OutboxRecord,
+    OutboxRepository,
     PaymentCallbackRepository,
 )
 from src.domain.entities import Order, OrderStatus, PaymentCallback
+from src.domain.events import ShipmentReceivedEvent
 from src.domain.exceptions import (
     ConcurrentOrderCreationError,
+    DuplicateInboxEventError,
     DuplicatePaymentCallbackError,
     OrderNotFoundError,
 )
-from src.infrastructure.persistence.models import OrderModel, PaymentCallbackModel
+from src.infrastructure.persistence.models import (
+    InboxEventModel,
+    OrderModel,
+    OutboxEventModel,
+    PaymentCallbackModel,
+)
 
 
 def _is_unique_violation(error: IntegrityError) -> bool:
@@ -33,6 +47,10 @@ def _is_unique_violation(error: IntegrityError) -> bool:
         or "duplicate key" in message
         or "constraint failed" in message
     )
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class OrderRepositoryImpl(OrderRepository):
@@ -161,5 +179,107 @@ class PaymentCallbackRepositoryImpl(PaymentCallbackRepository):
             if _is_unique_violation(e):
                 raise DuplicatePaymentCallbackError(
                     f"Callback для платежа {callback.payment_id} уже обработан."
+                ) from e
+            raise
+
+
+class OutboxRepositoryImpl(OutboxRepository):
+    """SQLAlchemy-реализация таблицы Outbox.
+
+    События пишутся в ту же транзакцию UoW, что и изменение заказа
+    (атомарность «данные + событие»). Воркер-публикатор выбирает
+    неотправленные записи и помечает их отправленными после доставки
+    в Kafka.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def add_event(
+        self,
+        *,
+        aggregate_id: str,
+        event_type: str,
+        payload: dict,
+        topic: str,
+    ) -> None:
+        """Поставить событие в очередь на публикацию (flush без commit)."""
+        model = OutboxEventModel(
+            topic=topic,
+            aggregate_id=aggregate_id,
+            event_type=event_type,
+            payload=json.dumps(payload, ensure_ascii=False),
+            created_at=_utcnow(),
+            published=False,
+        )
+        self._session.add(model)
+        await self._session.flush()
+
+    async def fetch_pending(self, limit: int = 50) -> Sequence[OutboxRecord]:
+        """Выбрать неотправленные события по возрастанию id (FIFO)."""
+        stmt = (
+            select(OutboxEventModel)
+            .where(OutboxEventModel.published.is_(False))
+            .order_by(OutboxEventModel.id)
+            .limit(limit)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            OutboxRecord(
+                id=model.id,
+                topic=model.topic,
+                aggregate_id=model.aggregate_id,
+                event_type=model.event_type,
+                payload=model.payload_dict(),
+            )
+            for model in result.scalars().all()
+        ]
+
+    async def mark_published(self, record_ids: Sequence[int]) -> None:
+        """Пометить события отправленными (после успешной доставки в Kafka)."""
+        if not record_ids:
+            return
+        stmt = (
+            update(OutboxEventModel)
+            .where(OutboxEventModel.id.in_(record_ids))
+            .values(published=True)
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+
+
+class InboxRepositoryImpl(InboxRepository):
+    """SQLAlchemy-реализация таблицы Inbox (дедупликация входящих событий).
+
+    Идемпотентность обеспечивается уникальным индексом `event_id`:
+    повторная вставка бросает IntegrityError, который транслируется в
+    `DuplicateInboxEventError` — штатный сигнал «событие уже обработано».
+    """
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def is_processed(self, event_id: str) -> bool:
+        """Возвращает True, если событие с таким event_id уже обработано."""
+        stmt = select(InboxEventModel.id).where(InboxEventModel.event_id == event_id)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    async def mark_processed(self, event: ShipmentReceivedEvent) -> None:
+        """Записать факт обработки входящего события (flush без commit)."""
+        model = InboxEventModel(
+            event_id=event.event_id,
+            event_type=event.event_type,
+            order_id=event.order_id,
+            payload=json.dumps(event.to_payload(), ensure_ascii=False),
+            processed_at=_utcnow(),
+        )
+        self._session.add(model)
+        try:
+            await self._session.flush()
+        except IntegrityError as e:
+            if _is_unique_violation(e):
+                raise DuplicateInboxEventError(
+                    f"Событие {event.event_id} уже обработано (Inbox)."
                 ) from e
             raise

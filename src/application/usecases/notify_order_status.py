@@ -213,14 +213,11 @@ class OrderNotifier:
 
     # --- доставка -------------------------------------------------------------
 
-    async def _deliver(
-        self, request: NotificationRequest, order_id: str
-    ) -> None:
+    async def _deliver(self, request: NotificationRequest, order_id: str) -> None:
         """Отправить уведомление с ограниченными повторами (best effort)."""
         if self._client is None:
             logger.debug(
-                "Notifications client unavailable; skipping notification "
-                "for order %s",
+                "Notifications client unavailable; skipping notification for order %s",
                 order_id,
             )
             return
@@ -232,8 +229,7 @@ class OrderNotifier:
                 # логируем его явно, чтобы по логам пода можно было
                 # подтвердить отправку каждого статуса (NEW/PAID/SHIPPED).
                 logger.info(
-                    "Notification delivered for order %s "
-                    "(status message %r, key=%s)",
+                    "Notification delivered for order %s (status message %r, key=%s)",
                     order_id,
                     request.message,
                     request.idempotency_key,

@@ -183,9 +183,7 @@ class CreateOrderUseCase:
             status_code = e.response.status_code
             logger.warning("Catalog error for item %s: HTTP %s", item_id, status_code)
             if status_code == HTTPStatus.NOT_FOUND:
-                raise ItemNotFoundError(
-                    f"Товар {item_id} не найден в каталоге."
-                ) from e
+                raise ItemNotFoundError(f"Товар {item_id} не найден в каталоге.") from e
             raise CatalogUnavailableError(
                 f"Catalog Service вернул ошибку HTTP {status_code} "
                 f"для товара {item_id}."

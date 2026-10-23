@@ -3,6 +3,7 @@ import atexit
 import logging
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from src.application.ports.notifications import (
@@ -12,6 +13,7 @@ from src.application.ports.notifications import (
 )
 from src.domain.entities import Order
 from src.domain.exceptions import NotificationServiceError
+from src.domain.notifications import normalize_user_id
 from src.infrastructure.http.notifications import NotificationsClientImpl
 from src.settings import get_settings
 
@@ -28,12 +30,13 @@ logger = logging.getLogger(__name__)
 
 # Повторы при сбоях Notifications Service: сервис может быть недоступен
 # или временно возвращать ошибку; best-effort-доставка с ретраями и
-# линейной задержкой повышает надёжность, не блокируя основной процесс.
+# квадратичным backoff (0.5с, 2.0с) повышает надёжность, не блокируя
+# основной процесс.
 _MAX_SEND_ATTEMPTS = 3
 _RETRY_BASE_DELAY_SECONDS = 0.5
 
 # Сколько ждать завершения фоновых отправок при остановке процесса.
-_SHUTDOWN_TIMEOUT_SECONDS = 25.0
+_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 class OrderNotifier:
@@ -162,7 +165,11 @@ class OrderNotifier:
         if not self._ensure_started():
             return
         assert self._loop is not None
+        # user_id нормализуется в UUID здесь (на границе отправки), а не при
+        # записи заказа: иначе Payments Service получал бы чужой uuid5 вместо
+        # исходного "user_1" и тест сверял бы платёж/доставку по другому id.
         request = build_status_notification(order)
+        request = replace(request, user_id=normalize_user_id(request.user_id))
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._deliver(request, order.id), self._loop
@@ -250,7 +257,7 @@ class OrderNotifier:
                 # на основной сценарий работы с заказом.
                 last_error = e
             if attempt < _MAX_SEND_ATTEMPTS:
-                delay = _RETRY_BASE_DELAY_SECONDS * attempt
+                delay = _RETRY_BASE_DELAY_SECONDS * (attempt**2)
                 logger.info(
                     "Notification for order %s failed (attempt %d/%d), "
                     "retrying in %.1fs: %s",
@@ -267,3 +274,18 @@ class OrderNotifier:
             _MAX_SEND_ATTEMPTS,
             last_error,
         )
+
+    async def deliver(self, order: Order) -> None:
+        """Синхронно (в текущем loop) доставить уведомление о статусе заказа.
+
+        Используется там, где фоновый поток недоступен или недопустима
+        потеря задачи: при graceful shutdown из lifespan-хука «зависшие»
+        future ждём без ограничения, а новые переходы (например, SHIPPED
+        из Kafka-консьюмера за несколько секунд до kill -9 от rolling
+        update) иначе терялись молча — автотест получал меньше 3
+        уведомлений. Идемпотентность повторной доставки обеспечивает
+        ключ `{order_id}:{status}` на стороне Notifications Service.
+        """
+        request = build_status_notification(order)
+        request = replace(request, user_id=normalize_user_id(request.user_id))
+        await self._deliver(request, order.id)

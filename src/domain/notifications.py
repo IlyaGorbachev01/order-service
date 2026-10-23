@@ -3,6 +3,8 @@
 Чистый domain-слой: не знает ни про HTTP, ни про порты application слоя.
 """
 
+import uuid
+
 from src.domain.entities import OrderStatus
 
 # В текст каждого статуса встроен маркер `[NEW]`/`[PAID]`/... — это тот же
@@ -39,3 +41,21 @@ def notification_idempotency_key(order_id: str, status: OrderStatus) -> str:
     с тем же ключом не создаёт дубликат на стороне Notifications Service.
     """
     return f"{order_id}:{status.value}"
+
+
+# Пространство имён для нормализации произвольных user_id заказчика в UUID.
+_USER_NS = uuid.uuid5(uuid.NAMESPACE_URL, "capashino-order-service")
+
+
+def normalize_user_id(value: str) -> str:
+    """Вернуть `value` как есть, если это уже UUID, иначе uuid5 от него.
+
+    Notifications Service принимает только UUID получателя; тесты шлют
+    строки вроде "user_1", и сервис падает своей 500-кой. Детерминированное
+    преобразование сохраняет различимость пользователей и идемпотентность
+    (одинаковый вход -> тот же id), а реальные UUID не меняются.
+    """
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return str(uuid.uuid5(_USER_NS, value))

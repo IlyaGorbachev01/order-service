@@ -31,6 +31,7 @@ class NotificationsClientImpl(NotificationClient):
         headers = {"X-API-Key": self._api_key}
         payload = {
             "message": request.message,
+            "user_id": request.user_id,
             "reference_id": request.reference_id,
             "idempotency_key": request.idempotency_key,
         }
@@ -40,10 +41,14 @@ class NotificationsClientImpl(NotificationClient):
             response.raise_for_status()
             data = response.json()
         except httpx.HTTPStatusError as e:
+            # Логируем тело ответа — по нему видно, чего не хватило сервису
+            # (например, отсутствующего поля), иначе диагностика сводится к
+            # бессмысленному «HTTP 500».
             logger.warning(
-                "Notifications error for order %s: HTTP %s",
+                "Notifications error for order %s: HTTP %s, body=%r",
                 request.reference_id,
                 e.response.status_code,
+                e.response.text[:300],
             )
             raise NotificationServiceError(
                 f"Notifications Service отклонил отправку уведомления "

@@ -10,6 +10,7 @@ class NotificationRequest:
     """Параметры отправки уведомления во внешний Notifications Service."""
 
     message: str
+    user_id: str  # получатель уведомления (Notifications Service требует его)
     reference_id: str  # order_id, к которому относится уведомление
     idempotency_key: str  # предотвращает дублирование уведомлений
 
@@ -20,10 +21,12 @@ def build_status_notification(order: Order) -> NotificationRequest:
     Текст берётся из domain-маппинга (`src/domain/notifications.py`), для
     CANCELLED используется причина отмены заказа. Ключ идемпотентности
     детерминирован (`{order_id}:{status}`), поэтому повторная обработка
-    того же перехода не создаёт дубликат уведомления.
+    того же перехода не создаёт дубликат уведомления. `user_id` — заказ
+    сервиса привязывает уведомление к пользователю.
     """
     return NotificationRequest(
         message=notification_message(order.status, reason=order.cancel_reason),
+        user_id=order.user_id,
         reference_id=order.id,
         idempotency_key=notification_idempotency_key(order.id, order.status),
     )

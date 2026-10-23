@@ -1,9 +1,13 @@
-from decimal import Decimal
+import logging
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
 from src.application.ports.catalog import CatalogClient, CatalogItem
+from src.domain.exceptions import CatalogUnavailableError
 from src.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class CatalogClientImpl(CatalogClient):
@@ -21,14 +25,42 @@ class CatalogClientImpl(CatalogClient):
 
         response = await self._client.get(url, headers=headers)
         response.raise_for_status()
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as e:
+            # Нестандартный ответ (невалидный JSON — например HTML-страница
+            # ошибки от ingress/прокси при 200). Без перевода в доменное
+            # исключение это дало бы 500 Internal Server Error.
+            logger.warning(
+                "Catalog returned non-JSON body for item %s: %.200r",
+                item_id,
+                response.text,
+            )
+            raise CatalogUnavailableError(
+                f"Catalog Service вернул некорректный ответ для товара {item_id}."
+            ) from e
+        if not isinstance(data, dict):
+            raise CatalogUnavailableError(
+                f"Catalog Service вернул неожиданный формат ответа "
+                f"для товара {item_id}."
+            )
 
-        return CatalogItem(
-            id=str(data["id"]),
-            name=str(data["name"]),
-            price=Decimal(str(data["price"])),
-            available_qty=int(data["available_qty"]),
-        )
+        try:
+            return CatalogItem(
+                id=str(data["id"]),
+                name=str(data["name"]),
+                price=Decimal(str(data["price"])),
+                available_qty=int(data["available_qty"]),
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as e:
+            # Неполный/неконвертируемый JSON — также не должен превращаться
+            # в 500: переводим в доменную ошибку недоступности каталога.
+            logger.warning(
+                "Catalog returned unexpected payload for item %s: %r", item_id, data
+            )
+            raise CatalogUnavailableError(
+                f"Catalog Service вернул некорректные данные товара {item_id}: {e}"
+            ) from e
 
     async def close(self) -> None:
         """Закрывает HTTP-клиент и освобождает ресурсы."""

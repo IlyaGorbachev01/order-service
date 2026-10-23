@@ -74,6 +74,13 @@ class OrderNotifier:
         """
         if client_factory is None:
             client_factory = _default_client_factory
+        elif isinstance(client_factory, NotificationClient):
+            # Допускаем передачу готового экземпляра клиента вместо
+            # фабрики: иначе вызов self._client_factory() в фоновом
+            # потоке падал с TypeError («'NotificationsClientImpl'
+            # object is not callable») и уведомления терялись молча.
+            client = client_factory
+            client_factory = lambda: client  # noqa: E731
         self._client_factory = client_factory
         self._client: NotificationClient | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -213,14 +220,11 @@ class OrderNotifier:
 
     # --- доставка -------------------------------------------------------------
 
-    async def _deliver(
-        self, request: NotificationRequest, order_id: str
-    ) -> None:
+    async def _deliver(self, request: NotificationRequest, order_id: str) -> None:
         """Отправить уведомление с ограниченными повторами (best effort)."""
         if self._client is None:
             logger.debug(
-                "Notifications client unavailable; skipping notification "
-                "for order %s",
+                "Notifications client unavailable; skipping notification for order %s",
                 order_id,
             )
             return
@@ -232,8 +236,7 @@ class OrderNotifier:
                 # логируем его явно, чтобы по логам пода можно было
                 # подтвердить отправку каждого статуса (NEW/PAID/SHIPPED).
                 logger.info(
-                    "Notification delivered for order %s "
-                    "(status message %r, key=%s)",
+                    "Notification delivered for order %s (status message %r, key=%s)",
                     order_id,
                     request.message,
                     request.idempotency_key,

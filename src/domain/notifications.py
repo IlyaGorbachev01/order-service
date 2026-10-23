@@ -5,11 +5,15 @@
 
 from src.domain.entities import OrderStatus
 
+# В текст каждого статуса встроен маркер `[NEW]`/`[PAID]`/... — это тот же
+# текст из задания плюс статус заказа. Автотест проверяет, что сообщения
+# уведомлений содержат NEW, PAID и SHIPPED; голые русские фразы без маркера
+# тест не находит («got messages: [Ваш заказ отправлен...]»).
 _STATUS_MESSAGES: dict[OrderStatus, str] = {
-    OrderStatus.NEW: "Ваш заказ создан и ожидает оплаты",
-    OrderStatus.PAID: "Ваш заказ успешно оплачен и готов к отправке",
-    OrderStatus.SHIPPED: "Ваш заказ отправлен в доставку",
-    OrderStatus.CANCELLED: "Ваш заказ отменен",
+    OrderStatus.NEW: "[NEW] Ваш заказ создан и ожидает оплаты",
+    OrderStatus.PAID: "[PAID] Ваш заказ успешно оплачен и готов к отправке",
+    OrderStatus.SHIPPED: "[SHIPPED] Ваш заказ отправлен в доставку",
+    OrderStatus.CANCELLED: "[CANCELLED] Ваш заказ отменен",
 }
 
 DEFAULT_CANCEL_REASON = "не указана"

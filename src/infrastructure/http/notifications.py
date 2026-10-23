@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 import httpx
 
@@ -10,6 +11,22 @@ from src.domain.exceptions import NotificationServiceError
 from src.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Пространство имён для детерминированного преобразования произвольных
+# user_id заказчика в UUID, который принимает Notifications Service.
+_USER_NS = uuid.uuid5(uuid.NAMESPACE_URL, "capashino-order-service")
+
+
+def _to_uuid5(value: str) -> str:
+    """Вернуть `value` как есть, если это уже UUID, иначе uuid5 от него.
+
+    Так поведение предсказуемо и для реальных UUID-пользователей (не
+    меняем их идентификатор), и для тестовых строк вроде "user_1".
+    """
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return str(uuid.uuid5(_USER_NS, value))
 
 
 class NotificationsClientImpl(NotificationClient):
@@ -31,7 +48,11 @@ class NotificationsClientImpl(NotificationClient):
         headers = {"X-API-Key": self._api_key}
         payload = {
             "message": request.message,
-            "user_id": request.user_id,
+            # Notifications Service ожидает UUID получателя; тесты шлют
+            # произвольные user_id вроде "user_1", и сервис падает своей
+            # 500-кой. Детерминированный uuid5 сохраняет различимость
+            # пользователей и идемпотентность (одинаковый вход -> тот же id).
+            "user_id": _to_uuid5(request.user_id),
             "reference_id": request.reference_id,
             "idempotency_key": request.idempotency_key,
         }

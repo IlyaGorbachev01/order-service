@@ -247,6 +247,41 @@ class OutboxRepositoryImpl(OutboxRepository):
             for model in result.scalars().all()
         ]
 
+    async def claim_pending(self, limit: int = 50) -> Sequence[OutboxRecord]:
+        """Забрать партию событий с блокировкой строк (FOR UPDATE SKIP LOCKED).
+
+        На PostgreSQL добавляет к SELECT `FOR UPDATE ... SKIP LOCKED`:
+        строки партии блокируются до конца транзакции воркера, а записи,
+        уже захваченные другим экземпляром, пропускаются без ожидания.
+        Публикация + `mark_published` выполняются в этой же транзакции,
+        поэтому две копии воркера никогда не обрабатывают одно событие
+        одновременно (не дублируют доставку при горизонтальном
+        масштабировании и гонке реплик).
+
+        SQLite (локальные тесты) не поддерживает skip locked — там метод
+        вырождается в обычный `fetch_pending`.
+        """
+        stmt = (
+            select(OutboxEventModel)
+            .where(OutboxEventModel.published.is_(False))
+            .order_by(OutboxEventModel.id)
+            .limit(limit)
+        )
+        bind_dialect = self._session.bind.dialect.name if self._session.bind else ""
+        if bind_dialect == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        result = await self._session.execute(stmt)
+        return [
+            OutboxRecord(
+                id=model.id,
+                topic=model.topic,
+                aggregate_id=model.aggregate_id,
+                event_type=model.event_type,
+                payload=model.payload_dict(),
+            )
+            for model in result.scalars().all()
+        ]
+
     async def mark_published(self, record_ids: Sequence[int]) -> None:
         """Пометить события отправленными (после успешной доставки в Kafka)."""
         if not record_ids:

@@ -87,6 +87,18 @@ class OutboxRepository(ABC):
         """
 
     @abstractmethod
+    async def claim_pending(self, limit: int = 50) -> Sequence[OutboxRecord]:
+        """Забрать партию событий с блокировкой строк (FOR UPDATE SKIP LOCKED).
+
+        Гарантирует, что одна и та же запись не обрабатывается двумя
+        экземплярами воркера одновременно: захвативший строку воркер
+        публикует событие, затем помечает его `mark_published` в той же
+        транзакции. Записи, заблокированные другими воркерами, пропускаются
+        без ожидания. На СУБД без поддержки skip locked эквивалентен
+        `fetch_pending`.
+        """
+
+    @abstractmethod
     async def mark_published(self, record_ids: Sequence[int]) -> None:
         """Пометить события отправленными (после успешной доставки в Kafka)."""
 

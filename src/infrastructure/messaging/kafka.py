@@ -216,12 +216,22 @@ class ShipmentConsumer:
             auto_offset_reset="earliest",
             enable_auto_commit=False,
             isolation_level="read_committed",
+            # Обработка одного сообщения включает HTTP-вызов к Notifications
+            # Service (несколько секунд) — дефолтный heartbeat 3s считает
+            # консьюмер «зависшим» и раскручивает бесконечные rebalances
+            # (в логах кластера наблюдались generation 603..608 за минуту;
+            # без назначенных партиций order.shipped не обрабатывались
+            # вообще). Увеличенные интервалы делают группу стабильной.
+            session_timeout_ms=30000,
+            heartbeat_interval_ms=10000,
+            max_poll_interval_ms=300000,
         )
         await consumer.start()
         self._consumer = consumer
         logger.info(
-            "Shipment consumer connected to %s",
+            "Shipment consumer connected to %s (group=%s)",
             self._settings.kafka_bootstrap_servers,
+            self._settings.kafka_consumer_group_id,
         )
         try:
             async for message in consumer:
@@ -239,10 +249,22 @@ class ShipmentConsumer:
                     self._fail_count += 1
                     self._last_failed_offset = current
                     if self._fail_count < self._poison_threshold:
-                        # Заказ, скорее всего, ещё не закоммичен — прерываем
-                        # цикл и переподключаемся; Kafka переотправит сообщение
-                        # с несохранённого offset (at-least-once).
-                        return
+                        # Заказ, скорее всего, ещё не закоммичен — НЕ
+                        # прерываем цикл и НЕ выходим из группы (раньше
+                        # переподключение на каждом ретрае вызывало
+                        # continuous rebalancing всей группы). Kafka
+                        # переотправит сообщение с несохранённого offset
+                        # при следующем fetch (at-least-once); пауза между
+                        # попытками — короткая.
+                        logger.warning(
+                            "Shipment event at offset=%s retry %d/%d in %.1fs",
+                            message.offset,
+                            self._fail_count,
+                            self._poison_threshold,
+                            self._retry_interval,
+                        )
+                        await asyncio.sleep(self._retry_interval)
+                        continue
                     # Отравленное сообщение: пропускаем offset и делаем паузу,
                     # чтобы не блокировать партицию бесконечными ретраями.
                     logger.error(

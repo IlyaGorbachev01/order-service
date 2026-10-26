@@ -185,17 +185,21 @@ class Settings(BaseSettings):
     # Kafka: интеграция с Shipping Service через события.
     kafka_bootstrap_servers: str = "kafka.kafka.svc.cluster.local:9092"
     # Consumer group Order Service для событий от Shipping Service.
-    # По умолчанию вычисляется из имени пода (HOSTNAME в Kubernetes — он
-    # уникален для каждого реплики/процесса): каждая копия консьюмера
-    # подписывается на топик `student_system-shipment.events` отдельно и
-    # получает ВСЕ сообщения (effective broadcasting). Дедупликация
-    # повторных доставок обеспечивается Inbox-паттерном по event_id, а
-    # переходы статуса идемпотентны на уровне доменной машины состояний.
-    # Так исключается классическая потеря событий при delivery-guarantee
-    # настройках кластера (offset коммитится после первой доставки группе,
-    # остальные копии их не получают) и зависание смещения из-за ошибок
-    # ретрах-политики одной копии. Явное значение KAFKA_CONSUMER_GROUP_ID
-    # всегда имеет приоритет (например, для общей группы в тестах).
+    # ВАЖНО: группа должна быть ОБЩЕЙ для всех копий воркера одного
+    # деплоя. Если дать каждой реплике собственную группу (broadcasting),
+    # то при отказе обработки «неизвестного» заказа (OrderNotFoundError)
+    # несохранённый offset бесконечно переотправляется каждой копией по
+    # кругу; с быстрым poison-скипом это превращается в continuous
+    # rebalancing, который блокирует всю консьюмерскую группу — легитимные
+    # order.shipped не обрабатываются (в логах кластера наблюдались
+    # generation 603..608 за минуту). При общей группе партиция назначена
+    # одному консьюмеру, retry/пропуск ядовитого сообщения локальны,
+    # дубликаты отсекает Inbox.
+    # Значение по умолчанию выводится из имени сервиса (SERVICE_NAME /
+    # APP_NAME / ORDER_SERVICE_NAME или HOSTNAME без pod-суффикса), чтобы
+    # все копии одного деплоя попали в одну группу; при неизвестности —
+    # стабильное имя по умолчанию. Явный KAFKA_CONSUMER_GROUP_ID всегда
+    # имеет приоритет.
     kafka_consumer_group_id: str = ""
     # Топик исходящих событий Order Service (order.paid)
     order_events_topic: str = "student_system-order.events"
@@ -205,17 +209,31 @@ class Settings(BaseSettings):
     outbox_poll_interval: float = 1.0
 
     def model_post_init(self, __context: object) -> None:
-        """Дописать уникальную suffix-у к consumer group по умолчанию.
+        """Собрать ОБЩУЕ имя consumer group по умолчанию (см. комментарий поля).
 
-        В Kubernetes HOSTNAME равен имени пода и уникален для каждой
-        реплики — так каждая копия worker'а попадает в собственную группу
-        и получает все события топика (см. комментарий поля). Локально
-        (без HOSTNAME) добавляется PID процесса. Явно заданная
+        Все копии воркера одного деплоя должны попадать в одну группу,
+        иначе ретраи «неизвестного» заказа раскручивают непрерывный
+        rebalance всей группы. Имя берётся из SERVICE_NAME / APP_NAME /
+        ORDER_SERVICE_NAME, либо из HOSTNAME с отрезанием pod-суффиксов
+        Deployment'а (две последние секции). Явно заданная
         KAFKA_CONSUMER_GROUP_ID остаётся без изменений.
         """
         if not self.kafka_consumer_group_id:
-            pod_identity = os.environ.get("HOSTNAME") or f"pid-{os.getpid()}"
-            self.kafka_consumer_group_id = f"order-service-{pod_identity}"
+            base = (
+                os.environ.get("SERVICE_NAME")
+                or os.environ.get("APP_NAME")
+                or os.environ.get("ORDER_SERVICE_NAME")
+                or ""
+            )
+            if not base:
+                hostname = os.environ.get("HOSTNAME", "")
+                parts = hostname.split("-")
+                # student-x-order-service-<rs-hash>-<pod-suffix> ->
+                # student-x-order-service
+                base = "-".join(parts[:-2]) if len(parts) > 2 else hostname
+            self.kafka_consumer_group_id = (
+                f"{base}-order-consumers" if base else "order-service-consumers"
+            )
 
         # Если ORDER_SERVICE_INTERNAL_URL не задана явно и автоопределение
         # из service-link переменных не сработало (например, enableServiceLinks

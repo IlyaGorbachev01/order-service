@@ -10,8 +10,8 @@
   строит доменное событие и передаёт его use case (Inbox-идемпотентность
   обеспечивает сам use case).
 
-Жизненный цикл обоих компонентов привязан к lifespan приложения
-(см. `src/main.py`).
+Оба компонента живут в отдельном фоновом процессе
+(`python -m src.bin.worker`, см. `run-worker.sh`), а не внутри API.
 """
 
 import asyncio
@@ -49,7 +49,7 @@ class KafkaEventPublisher(EventPublisher):
         self._producer: AIOKafkaProducer | None = None
 
     async def start(self) -> None:
-        """Подключиться к брокеру (вызывается из lifespan приложения)."""
+        """Подключиться к брокеру (вызывается при старте worker-процесса)."""
         if self._producer is not None:
             return
         producer = AIOKafkaProducer(

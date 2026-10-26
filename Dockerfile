@@ -13,10 +13,10 @@ RUN uv sync --frozen --no-dev
 COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
-COPY run.sh ./
+COPY run.sh run-worker.sh ./
 
 # Делаем скрипт запуска исполняемым
-RUN chmod +x ./run.sh
+RUN chmod +x ./run.sh ./run-worker.sh
 
 EXPOSE 8000
 

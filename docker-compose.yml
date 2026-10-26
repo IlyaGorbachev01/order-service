@@ -28,5 +28,20 @@ services:
       db:
         condition: service_healthy
 
+  # Фоновые компоненты (outbox relay + Kafka consumer) — отдельный процесс,
+  # как требует ТЗ (запуск из bin/, не фоновой корутиной в API).
+  worker:
+    build: .
+    command: ["bash", "./run-worker.sh"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/order_db
+      CAPASHINO_INTERNAL_URL: https://capashino.dev-2.python-labs.ru
+      CAPASHINO_API_TOKEN: ${CAPASHINO_API_TOKEN:-your-local-token}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka.kafka.svc.cluster.local:9092}
+      DEBUG: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   postgres_data:

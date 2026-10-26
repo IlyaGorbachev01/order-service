@@ -32,7 +32,12 @@ src/
 │   ├── http/                # Клиенты Catalog / Payments / Notifications (X-API-Key)
 │   └── messaging/           # Kafka producer/consumer, OutboxWorker, Inbox
 ├── presentation/api/        # FastAPI: routes/, schemas.py, dependencies.py (composition root)
-├── main.py                  # Фабрика create_app() + lifespan (outbox worker, consumer)
+├── bin/
+│   ├── worker.py            # Точка запуска фоновых компонентов ОТДЕЛЬНЫМ процессом:
+│   │                        # `python -m src.bin.worker` (outbox relay + shipment consumer)
+│   └── outbox_worker.py     # Алиас на worker (обратная совместимость команд запуска)
+├── main.py                  # Фабрика create_app() + lifespan (только HTTP-ресурсы;
+│                            # воркеры НЕ стартуют внутри API-процесса)
 └── settings.py              # pydantic-settings: вся конфигурация из переменных окружения
 alembic/                     # Миграции БД (orders, payment_callbacks, outbox_events, inbox_events)
 ```
@@ -140,8 +145,12 @@ Swagger: http://localhost:8000/docs
 CAPASHINO_API_TOKEN=<token> docker compose up --build
 ```
 
-Локально без Kafka работают REST-эндпоинты и интеграции с Capashino; консьюмер/outbox
-поднимаются автоматически при наличии брокера (lifespan приложения).
+Локально без Kafka работают REST-эндпоинты и интеграции с Capashino. Outbox-воркер и
+консьюмер Shipping Service запускаются **отдельным процессом** (не фоновой корутиной
+внутри API): контейнер `worker` в docker-compose выполняет `run-worker.sh` →
+`python -m src.bin.worker`. В кластере — второй Deployment/контейнер того же образа
+с той же командой и теми же переменными окружения (`DATABASE_URL`,
+`KAFKA_BOOTSTRAP_SERVERS`).
 
 ## Деплой (LMS / Kubernetes)
 

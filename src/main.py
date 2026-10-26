@@ -16,13 +16,16 @@ if TYPE_CHECKING:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    """Управление жизненным циклом приложения."""
+    """Управление жизненным циклом приложения.
+
+    Важно (требование ТЗ): Kafka-фоновые компоненты (outbox-воркер и
+    консьюмер событий Shipping Service) НЕ запускаются внутри процесса
+    API — они работают отдельным процессом (`python -m src.bin.worker`,
+    см. ``run-worker.sh``). Здесь HTTP-сервис только освобождает свои
+    ресурсы (HTTP-клиенты внешних сервисов, движок БД).
+    """
     settings = get_settings()
     engine: AsyncEngine = get_engine(settings.database_url)
-
-    # Kafka-компоненты Шага 3: publisher, outbox-воркер, consumer событий
-    # Shipping Service. Сбой брокера не валит HTTP-сервис (см. зависимости).
-    await dependencies.start_background_components()
 
     yield
 

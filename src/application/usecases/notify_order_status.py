@@ -87,8 +87,22 @@ class OrderNotifier(NotificationPort):
             # Фоновый режим (BackgroundTasks / create_task): задача
             # гарантированно доходит до планировщика, ошибка доставки не
             # влияет на основной сценарий.
+            #
+            # ВАЖНО: `BackgroundTasks.add_task` принимает СИНХРОННЫЙ
+            # коллбэк (func(*args)), который starlette выполняет через
+            # run_in_threadpool; передача корутины привела бы к
+            # TypeError ("the first argument must be callable") уже после
+            # отправки ответа. Поэтому в фоне планируем обычный sync
+            # коллбэк, который заводит доставку task'ом в работающем
+            # event loop (fire-and-forget) и страхует ошибку loop'а
+            # синхронным best-effort прогоном в потоке threadpool.
+            def _background_deliver(
+                req: NotificationRequest = request, oid: str = order.id
+            ) -> None:
+                self._spawn_or_run(req, oid)
+
             try:
-                self._scheduler(self._deliver(request, order.id))
+                self._scheduler(_background_deliver)
                 return
             except Exception:  # pragma: no cover - отказ планировщика
                 logger.exception(
@@ -131,6 +145,32 @@ class OrderNotifier(NotificationPort):
         `{order_id}:{status}` на стороне Notifications Service.
         """
         await self._deliver(self._build_request(order), order.id)
+
+    def _spawn_or_run(self, request: NotificationRequest, order_id: str) -> None:
+        """Вызывается СИНХРОННО из фона (threadpool у BackgroundTasks).
+
+        Пытается завести доставку task'ом в основном event loop процесса
+        (fire-and-forget; ошибки гасятся внутри `_deliver`). Если loop уже
+        недоступен (остановка приложения) — выполняем доставку синхронно в
+        этом же потоке через временный event loop: best-effort гарантия,
+        что уведомление не потеряется молча.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and not loop.is_closed():
+            loop.create_task(self._deliver(request, order_id))
+            return
+        # Loop нет (task запущен starlette в threadpool после завершения
+        # ответа) — крутим короткий локальный loop только под эту доставку.
+        try:
+            asyncio.run(self._deliver(request, order_id))
+        except Exception:  # pragma: no cover - отказ страховочного прогона
+            logger.exception(
+                "Inline fallback notification delivery failed for order %s",
+                order_id,
+            )
 
     async def _deliver(self, request: NotificationRequest, order_id: str) -> None:
         """Отправить уведомление с ограниченными повторами (best effort)."""

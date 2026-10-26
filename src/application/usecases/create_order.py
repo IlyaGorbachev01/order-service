@@ -17,6 +17,7 @@ from src.domain.exceptions import (
     CatalogUnavailableError,
     ConcurrentOrderCreationError,
     InsufficientStockError,
+    InvalidOrderTransitionError,
     ItemNotFoundError,
     PaymentServiceError,
 )
@@ -235,6 +236,14 @@ class CreateOrderUseCase:
         событие order.paid не публиковалось и доставка никогда не
         происходила (провалившийся шаг автотеста). Поэтому сначала
         внешний вызов, потом свежая транзакция перечитывания.
+
+        Идемпотентность перехода в PAID: Payments Service асинхронен и
+        может доставить успешный callback ОБРАТНО раньше, чем вернётся
+        HTTP-ответ create_payment. Тогда заказ в БД уже PAID, а повторный
+        `mark_paid` запрещён машиной состояний (PAID -> PAID) и бросил бы
+        InvalidOrderTransitionError -> 502 + отмена уже оплаченного заказа.
+        Это штатная гонка: событие order.paid уже поставлено в Outbox
+        callback-ом, поэтому просто оставляем текущий статус.
         """
         request = PaymentRequest(
             order_id=order.id,
@@ -280,7 +289,23 @@ class CreateOrderUseCase:
                     raise PaymentServiceError(f"Заказ {order.id} исчез из хранилища.")
 
                 if result.status is PaymentStatus.SUCCEEDED:
-                    fresh.mark_paid(payment_id=result.id)
+                    try:
+                        fresh.mark_paid(payment_id=result.id)
+                    except InvalidOrderTransitionError:
+                        # Гонка с callback: платёжный сервис доставил успех
+                        # раньше нашего HTTP-ответа — заказ уже PAID/SHIPPED,
+                        # событие order.paid уже в Outbox. Повторный переход
+                        # не требуется; прочее (CANCELLED) — честная ошибка.
+                        if fresh.status in (OrderStatus.PAID, OrderStatus.SHIPPED):
+                            logger.info(
+                                "Order %s already %s via payment callback; "
+                                "skipping duplicate mark_paid (payment %s)",
+                                fresh.id,
+                                fresh.status.value,
+                                result.id,
+                            )
+                        else:
+                            raise
                 elif result.status is PaymentStatus.FAILED:
                     fresh.mark_cancelled(reason="Payment rejected by service")
                 else:  # PENDING — ждём callback

@@ -108,7 +108,7 @@ callback идемпотентен).
 | Переменная | Обязательно | Описание / дефолт |
 |---|---|---|
 | `CAPASHINO_API_TOKEN` | ✅ | Личный API-токен (вкладка «Профиль» LMS); заголовок `X-API-Key` для всех сервисов Capashino |
-| `ORDER_SERVICE_INTERNAL_URL` | ✅ | Внутренний адрес сервиса для callback'ов: `http://<service-name>.<namespace>.svc:8000` |
+| `ORDER_SERVICE_INTERNAL_URL` | — | Внутренний адрес сервиса для callback'ов: `http://<service-name>.<namespace>.svc:8000`. Если не задана — вычисляется автоматически из service-link переменных Kubernetes (`*_SERVICE_HOST/_PORT`) или из `POD_NAME`+`NAMESPACE`; при невозможности — предупреждение в логах и пустой `callback_url` (платёж не подтвердится, заказ останется в `NEW`) |
 | `KAFKA_BOOTSTRAP_SERVERS` | ✅ | `kafka.kafka.svc.cluster.local:9092` |
 | `KAFKA_CONSUMER_GROUP_ID` | — | Пусто = уникальная группа на копию worker'а (`order-service-<pod>`): каждая получает все события топика, дедупликация — Inbox. Явное значение объединяет копии в одну группу |
 | `CAPASHINO_INTERNAL_URL` | — | Дефолт `http://student-system-capashino-web.student-system-capashino.svc:8000` |

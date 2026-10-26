@@ -95,10 +95,13 @@ def _default_order_service_internal_url() -> str:
         chosen_prefix: str | None = None
         chosen: dict[str, str] | None = None
         for prefix, pair in pairs.items():
-            if pair.get("host") and pair.get("port"):
-                if any(hint and hint in prefix for hint in hints):
-                    chosen_prefix, chosen = prefix, pair
-                    break
+            if (
+                pair.get("host")
+                and pair.get("port")
+                and any(hint and hint in prefix for hint in hints)
+            ):
+                chosen_prefix, chosen = prefix, pair
+                break
         if chosen is None:  # fallback: первая полная пара (обычно их немного)
             for prefix, pair in pairs.items():
                 if pair.get("host") and pair.get("port"):

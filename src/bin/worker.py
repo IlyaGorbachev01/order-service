@@ -1,11 +1,11 @@
 """Точка запуска фоновых компонентов отдельным процессом (worker).
 
 Состав процесса:
-* :class:`KafkaEventPublisher` — продюсер топика `order.events`;
-* :class:`OutboxWorker` — relay таблицы `outbox_events` в Kafka
-  (партии захватываются транзакцией `FOR UPDATE SKIP LOCKED`, поэтому
+* :class:`KafkaEventPublisher` — продюсер топика ``order.events``;
+* :class:`OutboxWorker` — relay таблицы ``outbox_events`` в Kafka
+  (партии захватываются транзакцией ``FOR UPDATE SKIP LOCKED``, поэтому
   несколько копий воркера безопасны);
-* :class:`ShipmentConsumer` — консьюмер топика `shipment.events` с
+* :class:`ShipmentConsumer` — консьюмер топика ``shipment.events`` с
   Inbox-идемпотентностью на уровне use case.
 
 Graceful shutdown: SIGTERM/SIGINT останавливает оба компонента и закрывает
@@ -18,7 +18,10 @@ import logging
 import signal
 
 from src.application.usecases.handle_shipment_event import HandleShipmentEventUseCase
-from src.application.usecases.notification_dispatcher import NotificationDispatcher
+from src.application.usecases.notification_dispatcher import (
+    InflightTracker,
+    NotificationDispatcher,
+)
 from src.domain.events import ShipmentReceivedEvent
 from src.infrastructure.http.notifications import NotificationsClientImpl
 from src.infrastructure.messaging.kafka import KafkaEventPublisher, ShipmentConsumer
@@ -38,7 +41,13 @@ class WorkerRuntime:
         self._session_factory = get_session_factory(settings.database_url)
         self._publisher = KafkaEventPublisher(settings)
         self._notifications_client = NotificationsClientImpl(settings)
-        self._dispatcher = NotificationDispatcher(self._notifications_client)
+        # Фоновые доставки уведомлений заводятся create_task в основном
+        # loop процесса; трекер нужен, чтобы на stop() дождаться их до
+        # закрытия HTTP-клиента Notifications Service.
+        self._notification_tracker = InflightTracker()
+        self._dispatcher = NotificationDispatcher(
+            self._notifications_client, tracker=self._notification_tracker
+        )
 
         self._outbox_worker = OutboxWorker(
             uow_factory=self._new_uow,
@@ -84,7 +93,7 @@ class WorkerRuntime:
         await self._outbox_worker.stop()
         # Сначала дожидаемся фоновых отправок уведомлений — они используют
         # HTTP-клиент Notifications Service, который закрывается ниже.
-        await self._dispatcher.wait_pending()
+        await self._notification_tracker.wait_pending()
         await self._publisher.stop()
         await self._notifications_client.close()
         engine = self._session_factory.kw["bind"]

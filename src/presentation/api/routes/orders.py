@@ -1,8 +1,8 @@
 from http import HTTPStatus
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-from src.application.usecases.create_order import CreateOrderCommand
+from src.application.usecases.create_order import CreateOrderCommand, NotificationPort
 from src.domain.exceptions import (
     CatalogUnavailableError,
     ConcurrentOrderCreationError,
@@ -11,16 +11,30 @@ from src.domain.exceptions import (
     OrderNotFoundError,
     PaymentServiceError,
 )
-from src.presentation.api.dependencies import CreateOrderUseCaseDep, GetOrderUseCaseDep
+from src.presentation.api.dependencies import (
+    CreateOrderUseCaseDep,
+    GetOrderUseCaseDep,
+    NotificationDispatcherDep,
+)
 from src.presentation.api.schemas import OrderCreateRequest, OrderResponse
 
 router = APIRouter(prefix="/api/orders", tags=["Orders"])
 
 
+async def _notify_new_order(
+    notifier: NotificationPort, order: object, created: bool
+) -> None:
+    """Фоновая задача: уведомить о NEW только если заказ создан этим запросом."""
+    if created:
+        await notifier.notify(order)  # type: ignore[arg-type]
+
+
 @router.post("", status_code=HTTPStatus.CREATED, response_model=OrderResponse)
 async def create_order(
     request: OrderCreateRequest,
+    background_tasks: BackgroundTasks,
     use_case: CreateOrderUseCaseDep,
+    dispatcher: NotificationDispatcherDep,
 ) -> OrderResponse:
     """Создает новый заказ.
 
@@ -35,7 +49,15 @@ async def create_order(
             item_id=request.item_id,
             idempotency_key=request.idempotency_key,
         )
-        order = await use_case(command)
+        order, created = await use_case(command)
+        # Уведомление о создании заказа (NEW) — в фоне, после ответа клиенту.
+        # Для повторного идемпотентного запроса (created=False) задача
+        # no-op: уведомление не дублируется (плюс детерминированный ключ
+        # {order_id}:{status} на стороне Notifications Service).
+        notifier: NotificationPort = dispatcher.request_notifier(
+            background_tasks.add_task
+        )
+        background_tasks.add_task(_notify_new_order, notifier, order, created)
         return OrderResponse.model_validate(order)
     except (InsufficientStockError, ItemNotFoundError) as e:
         # Товар отсутствует или его недостаточно — бизнес-ошибка клиента.

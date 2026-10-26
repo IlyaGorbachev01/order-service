@@ -2,7 +2,7 @@ import logging
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.application.usecases.create_order import CreateOrderUseCase
@@ -95,8 +95,9 @@ NotificationsClientDep = Annotated[
 
 # --- Диспетчер уведомлений (синглтон уровня приложения) ---
 # Все use case'ы используют ОДИН OrderNotifier: фоновые задачи отправки
-# уведомлений переживают завершение HTTP-запроса и не теряются при сборке
-# мусора; при остановке приложения ожидаем их завершения (shutdown_resources).
+# переживают завершение HTTP-запроса; конкретный планировщик доставки
+# (BackgroundTasks.add_task) подставляется на каждый запрос в роутах —
+# см. get_create_order_use_case / get_process_payment_callback_use_case.
 
 _notification_dispatcher_singleton: NotificationDispatcher | None = None
 
@@ -119,19 +120,24 @@ NotificationDispatcherDep = Annotated[
 
 
 def get_create_order_use_case(
+    background_tasks: BackgroundTasks,
     uow: UowDep,
     catalog_client: CatalogClientDep,
     payments_client: PaymentsClientDep,
     dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
 ) -> CreateOrderUseCase:
-    """Создает сценарий оформления заказа (оплата + уведомления)."""
+    """Создает сценарий оформления заказа (оплата + уведомления).
+
+    Нотификатор передаётся строго через конструктор use case (DI): сам
+    use case не импортирует infrastructure и не создаёт клиентов сам.
+    """
     return CreateOrderUseCase(
         uow,
         catalog_client,
+        notifier=dispatcher.request_notifier(background_tasks.add_task),
         payments_client=payments_client,
         callback_url=settings.payment_callback_url,
-        notifier=dispatcher.notifier,
     )
 
 
@@ -143,6 +149,7 @@ def get_get_order_use_case(
 
 
 def get_process_payment_callback_use_case(
+    background_tasks: BackgroundTasks,
     uow: UowDep,
     dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
@@ -150,8 +157,8 @@ def get_process_payment_callback_use_case(
     """Создает сценарий обработки callback-а от Payments Service."""
     return ProcessPaymentCallbackUseCase(
         uow,
+        dispatcher.request_notifier(background_tasks.add_task),
         order_events_topic=settings.order_events_topic,
-        notifier=dispatcher.notifier,
     )
 
 

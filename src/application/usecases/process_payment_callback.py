@@ -2,7 +2,7 @@ import logging
 
 from src.application.ports.repositories import OutboxRepository
 from src.application.ports.uow import BaseUnitOfWork
-from src.application.usecases.notify_order_status import OrderNotifier
+from src.application.usecases.create_order import NotificationPort
 from src.domain.entities import PaymentCallback
 from src.domain.events import ORDER_PAID_EVENT, OrderPaidEvent
 from src.domain.exceptions import (
@@ -83,14 +83,15 @@ class ProcessPaymentCallbackUseCase:
     def __init__(
         self,
         uow: BaseUnitOfWork,
+        notifier: NotificationPort,
         *,
         order_events_topic: str = "",
-        notifier: OrderNotifier | None = None,
     ):
         self._uow = uow
         self._order_events_topic = order_events_topic
-        # Общий синглтонный нотификатор (см. NotificationDispatcher).
-        self._notifier = notifier if notifier is not None else OrderNotifier()
+        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
+        # создаёт инфраструктурные реализации сам и ничего о них не знает.
+        self._notifier = notifier
 
     async def __call__(self, callback: PaymentCallback) -> None:
         """Обработать callback платежа.
@@ -179,4 +180,4 @@ class ProcessPaymentCallbackUseCase:
         # Уведомление о новом статусе (PAID/CANCELLED) — после коммита
         # транзакции, чтобы не отправлять уведомление при последующем откате.
         # OrderNotifier перехватывает ошибки сервиса и лишь логирует их.
-        self._notifier.notify(order)
+        await self._notifier.notify(order)

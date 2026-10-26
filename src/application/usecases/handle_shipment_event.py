@@ -1,7 +1,7 @@
 import logging
 
 from src.application.ports.uow import BaseUnitOfWork
-from src.application.usecases.notify_order_status import OrderNotifier
+from src.application.usecases.create_order import NotificationPort
 from src.domain.events import ShipmentReceivedEvent
 from src.domain.exceptions import (
     DuplicateInboxEventError,
@@ -37,11 +37,12 @@ class HandleShipmentEventUseCase:
     def __init__(
         self,
         uow: BaseUnitOfWork,
-        notifier: OrderNotifier | None = None,
+        notifier: NotificationPort,
     ):
         self._uow = uow
-        # Общий синглтонный нотификатор
-        self._notifier = notifier if notifier is not None else OrderNotifier()
+        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
+        # создаёт инфраструктурные реализации сам и ничего о них не знает.
+        self._notifier = notifier
 
     async def __call__(self, event: ShipmentReceivedEvent) -> None:
         """Обработать событие доставки.
@@ -126,4 +127,4 @@ class HandleShipmentEventUseCase:
         # Уведомление о новом статусе (SHIPPED/CANCELLED) — после
         # коммита транзакции. Ошибки Notifications Service логируются
         # внутри OrderNotifier и не прерывают обработку события консьюмером.
-        self._notifier.notify(order)
+        await self._notifier.notify(order)

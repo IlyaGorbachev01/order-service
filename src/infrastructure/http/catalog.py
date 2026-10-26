@@ -1,17 +1,28 @@
 import logging
 from decimal import Decimal, InvalidOperation
+from http import HTTPStatus
 
 import httpx
 
 from src.application.ports.catalog import CatalogClient, CatalogItem
-from src.domain.exceptions import CatalogUnavailableError
+from src.domain.exceptions import (
+    CatalogUnavailableError,
+    ItemNotFoundError,
+)
 from src.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
 class CatalogClientImpl(CatalogClient):
-    """HTTP-клиент для получения данных из каталога."""
+    """HTTP-клиент для получения данных из каталога.
+
+    Все HTTP-детали (`httpx.HTTPStatusError`, сетевые сбои, некорректный
+    payload) транслируются здесь в доменные исключения — `ItemNotFoundError`
+    (404: «товара нет», штатная бизнес-ситуация) и `CatalogUnavailableError`
+    (прочие ошибки). Слой application работает только с доменными ошибками и
+    не импортирует httpx (правило зависимостей чистой архитектуры).
+    """
 
     def __init__(self, settings: Settings):
         self._base_url = settings.capashino_internal_url
@@ -23,8 +34,22 @@ class CatalogClientImpl(CatalogClient):
         url = f"{self._base_url}/api/catalog/items/{item_id}"
         headers = {"X-API-Key": self._api_key}
 
-        response = await self._client.get(url, headers=headers)
-        response.raise_for_status()
+        try:
+            response = await self._client.get(url, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            logger.warning("Catalog error for item %s: HTTP %s", item_id, status_code)
+            if status_code == HTTPStatus.NOT_FOUND:
+                raise ItemNotFoundError(f"Товар {item_id} не найден в каталоге.") from e
+            raise CatalogUnavailableError(
+                f"Catalog Service вернул ошибку HTTP {status_code} "
+                f"для товара {item_id}."
+            ) from e
+        except httpx.HTTPError as e:
+            logger.warning("Catalog service unavailable: %s", e)
+            raise CatalogUnavailableError(f"Catalog Service недоступен: {e}") from e
+
         try:
             data = response.json()
         except ValueError as e:

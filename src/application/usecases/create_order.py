@@ -4,14 +4,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from http import HTTPStatus
-
-import httpx
+from typing import Protocol
 
 from src.application.ports.catalog import CatalogClient, CatalogItem
 from src.application.ports.payments import PaymentRequest, PaymentsClient
 from src.application.ports.uow import BaseUnitOfWork
-from src.application.usecases.notify_order_status import OrderNotifier
 from src.domain.entities import Order, OrderStatus, PaymentStatus
 from src.domain.exceptions import (
     CatalogUnavailableError,
@@ -27,6 +24,23 @@ logger = logging.getLogger(__name__)
 # Повторы при гонке на уникальном индексе idempotency_key
 _MAX_IDEMPOTENCY_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 0.05
+
+
+class NotificationPort(Protocol):
+    """Порт отправки уведомлений о смене статуса заказа.
+
+    Use case зависит только от этого абстрактного контракта (правило
+    зависимостей чистой архитектуры): конкретная реализация
+    (`OrderNotifier`) передаётся строго извне — через композицию корня
+    (`presentation/api/dependencies.py`, `src/bin/worker.py`). Никаких
+    импортов infrastructure и httpx здесь нет: HTTP-детали внешних
+    сервисов полностью транслируются в доменные исключения внутри
+    `infrastructure/http/`.
+    """
+
+    async def notify(self, order: Order) -> None:
+        """Поставить уведомление о текущем статусе заказа (best-effort)."""
+        ...
 
 
 @dataclass
@@ -57,65 +71,63 @@ class CreateOrderUseCase:
         self,
         uow: BaseUnitOfWork,
         catalog_client: CatalogClient,
+        notifier: NotificationPort,
         payments_client: PaymentsClient | None = None,
         callback_url: str = "",
-        notifier: OrderNotifier | None = None,
     ):
         self._uow = uow
         self._catalog_client = catalog_client
         self._payments_client = payments_client
         self._callback_url = callback_url
-        # Общий (синглтонный) нотификатор: фоновые задачи отправки
-        # переживают завершение запроса — см. NotificationDispatcher.
-        self._notifier = notifier if notifier is not None else OrderNotifier()
+        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
+        # создаёт инфраструктурные реализации сам и ничего о них не знает.
+        self._notifier = notifier
 
-    async def __call__(self, command: CreateOrderCommand) -> Order:
-        """Выполнить сценарий создания заказа."""
+    async def __call__(self, command: CreateOrderCommand) -> tuple[Order, bool]:
+        """Выполнить сценарий создания заказа.
+
+        Возвращает (заказ, создан_сейчас). Флаг нужен HTTP-слою, чтобы
+        отправлять уведомление о NEW ровно один раз: повторный идемпотентный
+        запрос возвращает существующий заказ без побочных эффектов.
+        """
         order, created = await self._create_order(command)
-        if created:
-            # Уведомление о создании заказа (NEW). Отправляется только
-            # для нового заказа — повторный идемпотентный запрос не дублирует
-            # уведомления (плюс детерминированный ключ {order_id}:{status}).
-            self._notifier.notify(order)
+        if created and self._payments_client is not None:
             # Платёж создаём только для нового заказа: повторный запрос с тем же
             # idempotency_key возвращает исходный заказ без побочных эффектов.
-            if self._payments_client is not None:
-                try:
-                    amount = await self._resolve_amount(order)
-                    order = await self._create_payment(
-                        order, amount, self._callback_url
-                    )
-                except PaymentServiceError as e:
-                    # Платёжный сбой — побочный эффект, а не отказ валидации:
-                    # заказ уже сохранён и отменён (CANCELLED), основной ответ
-                    # остаётся успешным 201 по спецификации. Иначе недоступный
-                    # Payments превращал happy-path в 5xx (провалившийся шаг
-                    # автотеста order_create_success). Причина логируется и
-                    # видна в Sentry как handled-исключение.
-                    logger.warning(
-                        "Order %s created but payment failed; returning 201 "
-                        "with cancelled order: %s",
-                        order.id,
-                        e,
-                    )
-                    order = await self._reload_order(order.id) or order
-                except (ItemNotFoundError, CatalogUnavailableError) as e:
-                    # Товар «исчез» из каталога между проверкой стока и
-                    # расчётом суммы либо Catalog Service стал недоступен.
-                    # Это тоже сбой зависимого сервиса на этапе платежа:
-                    # отменяем заказ и возвращаем 201 с CANCELLED — тест
-                    # может повторить запрос с новым idempotency_key.
-                    logger.warning(
-                        "Order %s: catalog failure during payment step (%s); "
-                        "cancelling order and returning 201.",
-                        order.id,
-                        e,
-                    )
-                    await self._cancel_order(
-                        order.id, reason=f"Catalog failure at payment step: {e}"
-                    )
-                    order = await self._reload_order(order.id) or order
-        return order
+            try:
+                amount = await self._resolve_amount(order)
+                order = await self._create_payment(order, amount, self._callback_url)
+            except PaymentServiceError as e:
+                # Платёжный сбой — побочный эффект, а не отказ валидации:
+                # заказ уже сохранён и отменён (CANCELLED), основной ответ
+                # остаётся успешным 201 по спецификации. Иначе недоступный
+                # Payments превращал happy-path в 5xx (провалившийся шаг
+                # автотеста order_create_success). Причина логируется и
+                # видна в Sentry как handled-исключение.
+                logger.warning(
+                    "Order %s created but payment failed; returning 201 "
+                    "with cancelled order: %s",
+                    order.id,
+                    e,
+                )
+                order = await self._reload_order(order.id) or order
+            except (ItemNotFoundError, CatalogUnavailableError) as e:
+                # Товар «исчез» из каталога между проверкой стока и
+                # расчётом суммы либо Catalog Service стал недоступен.
+                # Это тоже сбой зависимого сервиса на этапе платежа:
+                # отменяем заказ и возвращаем 201 с CANCELLED — тест
+                # может повторить запрос с новым idempotency_key.
+                logger.warning(
+                    "Order %s: catalog failure during payment step (%s); "
+                    "cancelling order and returning 201.",
+                    order.id,
+                    e,
+                )
+                await self._cancel_order(
+                    order.id, reason=f"Catalog failure at payment step: {e}"
+                )
+                order = await self._reload_order(order.id) or order
+        return order, created
 
     async def _reload_order(self, order_id: str) -> Order | None:
         """Прочитать актуальное состояние заказа (для ответа после сбоя)."""
@@ -227,27 +239,14 @@ class CreateOrderUseCase:
             return await uow.orders.get_by_idempotency_key(idempotency_key)
 
     async def _get_catalog_item(self, item_id: str) -> CatalogItem:
-        """Получить товар из Catalog Service, переводя ошибки в доменные.
+        """Получить товар из Catalog Service.
 
-        404 от каталога — это «товара нет», штатная бизнес-ситуация:
-        транслируется в ItemNotFoundError (роут отдаёт 400). Прочие
-        HTTP-ошибки и сетевые сбои — CatalogUnavailableError (422/502),
-        но никак не 500 Internal Server Error.
+        Клиент каталога сам транслирует HTTP-детали в доменные исключения
+        (`ItemNotFoundError` для 404, `CatalogUnavailableError` для прочих
+        сбоев) — здесь нет импортов httpx (правило зависимостей). Роут
+        превращает их в 400/422, но не в 500 Internal Server Error.
         """
-        try:
-            return await self._catalog_client.get_item(item_id)
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            logger.warning("Catalog error for item %s: HTTP %s", item_id, status_code)
-            if status_code == HTTPStatus.NOT_FOUND:
-                raise ItemNotFoundError(f"Товар {item_id} не найден в каталоге.") from e
-            raise CatalogUnavailableError(
-                f"Catalog Service вернул ошибку HTTP {status_code} "
-                f"для товара {item_id}."
-            ) from e
-        except httpx.HTTPError as e:
-            logger.warning("Catalog service unavailable: %s", e)
-            raise CatalogUnavailableError(f"Catalog Service недоступен: {e}") from e
+        return await self._catalog_client.get_item(item_id)
 
     async def _resolve_amount(self, order: Order) -> Decimal:
         """Рассчитать сумму платежа по цене товара из каталога."""
@@ -364,7 +363,7 @@ class CreateOrderUseCase:
                 # Уведомление о синхронном итоге платежа (PAID/CANCELLED).
                 # Для PENDING итог придёт на callback и будет отправлен там.
                 if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
-                    self._notifier.notify(updated)
+                    await self._notifier.notify(updated)
                 return updated
         except PaymentServiceError:
             raise
@@ -393,7 +392,7 @@ class CreateOrderUseCase:
             await uow.commit()
             logger.info("Order %s cancelled: %s", order_id, reason)
             # Уведомление об отмене заказа (CANCELLED).
-            self._notifier.notify(updated)
+            await self._notifier.notify(updated)
 
     @staticmethod
     def _build_payment_idempotency_key(order_id: str) -> str:

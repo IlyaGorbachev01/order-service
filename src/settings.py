@@ -83,14 +83,27 @@ class Settings(BaseSettings):
 
     # Kafka: интеграция с Shipping Service через события.
     kafka_bootstrap_servers: str = "kafka.kafka.svc.cluster.local:9092"
-    # Consumer group Order Service для событий от Shipping Service
-    kafka_consumer_group_id: str = "order-service"
+    # Consumer group Order Service для событий от Shipping Service.
+    kafka_consumer_group_id: str = ""
     # Топик исходящих событий Order Service (order.paid)
     order_events_topic: str = "student_system-order.events"
     # Топик входящих событий Shipping Service (order.shipped / order.cancelled)
     shipment_events_topic: str = "student_system-shipment.events"
     # Интервал опроса outbox-таблицы публикатором, сек.
     outbox_poll_interval: float = 1.0
+
+    def model_post_init(self, __context: object) -> None:
+        """Дописать уникальную suffix-у к consumer group по умолчанию.
+
+        В Kubernetes HOSTNAME равен имени пода и уникален для каждой
+        реплики — так каждая копия worker'а попадает в собственную группу
+        и получает все события топика (см. комментарий поля). Локально
+        (без HOSTNAME) добавляется PID процесса. Явно заданная
+        KAFKA_CONSUMER_GROUP_ID остаётся без изменений.
+        """
+        if not self.kafka_consumer_group_id:
+            pod_identity = os.environ.get("HOSTNAME") or f"pid-{os.getpid()}"
+            self.kafka_consumer_group_id = f"order-service-{pod_identity}"
 
     @property
     def payment_callback_url(self) -> str:

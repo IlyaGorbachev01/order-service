@@ -125,6 +125,19 @@ class CreateOrderUseCase:
 
         Возвращает (заказ, создан_сейчас). Для уже существующего заказа
         второй флаг — False, чтобы не дублировать платёж.
+
+        Важно: транзакция фиксируется (`commit`) до выхода из блока, а не
+        только на `__aexit__` UoW. Иначе вызовы внешних сервисов (Catalog
+        при расчёте суммы, Payments при создании платежа, Notifications
+        при отправке уведомления о NEW) попадали бы в окно между началом
+        транзакции и её коммитом: Payments Service мог доставить callback
+        ОБРАТНО в этот же сервис ещё до коммита заказа. Callback работает
+        в отдельном соединении БД и при READ COMMITTED не видит незаком-
+        миченный заказ -> 404 OrderNotFound; повторной доставки Payments
+        Service не делает, заказ навсегда остаётся в NEW, а тест не дос-
+        тигает ни PAID, ни SHIPPED (провалившийся шаг автотеста).
+        Явный commit сразу после create() устраняет это состояние гонки:
+        к моменту HTTP-вызова в Payments заказ уже виден всем соединениям.
         """
         async with self._uow() as uow:
             # 1. Проверка идемпотентности
@@ -158,10 +171,11 @@ class CreateOrderUseCase:
                 updated_at=now,
             )
 
-            # 4. Сохранение заказа в статусе NEW (коммит транзакции)
+            # 4. Сохранение заказа в статусе NEW + явный коммит (см. docstring)
             #    Нарушение unique по idempotency_key бросает
             #    ConcurrentOrderCreationError -> повтор в _create_order.
             created = await uow.orders.create(order)
+            await uow.commit()
             return order, created
 
     async def _find_existing(self, idempotency_key: str) -> Order | None:
@@ -206,6 +220,21 @@ class CreateOrderUseCase:
         (CANCELLED) и бросается PaymentServiceError. Если сервис вернул
         синхронный успех (succeeded) — заказ сразу переходит в PAID;
         при pending итог придёт на callback_url.
+
+        Важно про порядок операций: HTTP-запрос к Payments Service
+        выполняется ДО открытия транзакции перечитывания заказа. UoW
+        открывает сессию лениво при первом обращении к репозиторию, а
+        SQLAlchemy начинает SQL-транзакцию (`BEGIN`) на первом же запросе.
+        Если бы чтение `fresh` предшествовало вызову платежей, к моменту
+        HTTP-запроса у процесса уже висела бы открытая (в READ COMMITTED —
+        snapshot для REPEATABLE READ) транзакция. Асинхронный Payments
+        Service доставляет callback ОБРАТНО в этот же сервис, callback
+        коммитит переход заказа в PAID в другом соединении, а «старое»
+        зависшее транзакт-чтение затем перезаписывало бы статус своим
+        устаревшим снимком (NEW) — платеж терялся, заказ залипал в NEW,
+        событие order.paid не публиковалось и доставка никогда не
+        происходила (провалившийся шаг автотеста). Поэтому сначала
+        внешний вызов, потом свежая транзакция перечитывания.
         """
         request = PaymentRequest(
             order_id=order.id,
@@ -224,9 +253,15 @@ class CreateOrderUseCase:
             )
         try:
             result = await self._payments_client.create_payment(request)
-        except PaymentServiceError:
+        except PaymentServiceError as e:
+            # Бросаем исходную ошибку ПОСЛЕ отмены заказа: _cancel_order
+            # использует новый UoW (новую сессию/транзакцию), а в SQLite
+            # пул StaticPool разделяет одно соединение между сессиями —
+            # открытый к этому моменту read-only транзакт перечитывания
+            # заказа блокировал бы запись отмены и давал "database is
+            # locked" вместо честного PaymentServiceError.
             await self._cancel_order(order.id, reason="Payment service error")
-            raise
+            raise e
         except Exception as e:  # любой сбой клиента = отмена заказа
             logger.warning("Payments client failure for order %s: %s", order.id, e)
             await self._cancel_order(order.id, reason=f"Payment failed: {e}")
@@ -234,30 +269,48 @@ class CreateOrderUseCase:
                 f"Не удалось создать платёж для заказа {order.id}: {e}"
             ) from e
 
-        async with self._uow() as uow:
-            fresh = await uow.orders.get_by_id(order.id)
-            if fresh is None:  # pragma: no cover - защита от гонки удаления
-                raise PaymentServiceError(f"Заказ {order.id} исчез из хранилища.")
+        # Перечитывание и актуализация заказа — отдельная (новая)
+        # транзакция, открытая уже ПОСЛЕ внешнего вызова (см. docstring).
+        # Любые сбои этого шага означают «платёж не зафиксирован в
+        # заказе»: заказ отменяется, ошибка отдаётся наружу.
+        try:
+            async with self._uow() as uow:
+                fresh = await uow.orders.get_by_id(order.id)
+                if fresh is None:  # pragma: no cover - защита от гонки удаления
+                    raise PaymentServiceError(f"Заказ {order.id} исчез из хранилища.")
 
-            if result.status is PaymentStatus.SUCCEEDED:
-                fresh.mark_paid(payment_id=result.id)
-            elif result.status is PaymentStatus.FAILED:
-                fresh.mark_cancelled(reason="Payment rejected by service")
-            else:  # PENDING — ждём callback
-                fresh.payment_id = result.id
+                if result.status is PaymentStatus.SUCCEEDED:
+                    fresh.mark_paid(payment_id=result.id)
+                elif result.status is PaymentStatus.FAILED:
+                    fresh.mark_cancelled(reason="Payment rejected by service")
+                else:  # PENDING — ждём callback
+                    fresh.payment_id = result.id
 
-            updated = await uow.orders.update(fresh)
-            logger.info(
-                "Order %s: payment %s created, status=%s",
-                order.id,
-                result.id,
-                updated.status.value,
+                updated = await uow.orders.update(fresh)
+                await uow.commit()
+                logger.info(
+                    "Order %s: payment %s created, status=%s",
+                    order.id,
+                    result.id,
+                    updated.status.value,
+                )
+                # Уведомление о синхронном итоге платежа (PAID/CANCELLED).
+                # Для PENDING итог придёт на callback и будет отправлен там.
+                if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
+                    self._notifier.notify(updated)
+                return updated
+        except PaymentServiceError:
+            raise
+        except Exception as e:
+            logger.exception(
+                "Failed to register payment %s for order %s", result.id, order.id
             )
-            # Уведомление о синхронном итоге платежа (PAID/CANCELLED).
-            # Для PENDING итог придёт на callback и будет отправлен там.
-            if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
-                self._notifier.notify(updated)
-            return updated
+            await self._cancel_order(
+                order.id, reason=f"Payment registration failed: {e}"
+            )
+            raise PaymentServiceError(
+                f"Не удалось зафиксировать платёж для заказа {order.id}: {e}"
+            ) from e
 
     async def _cancel_order(self, order_id: str, reason: str) -> None:
         """Отменить заказ после сбоя платежа (best-effort)."""
@@ -270,6 +323,7 @@ class CreateOrderUseCase:
                 return
             order.mark_cancelled(reason=reason)
             updated = await uow.orders.update(order)
+            await uow.commit()
             logger.info("Order %s cancelled: %s", order_id, reason)
             # Уведомление об отмене заказа (CANCELLED).
             self._notifier.notify(updated)

@@ -21,11 +21,11 @@ import logging
 from collections.abc import Callable, Coroutine, Sequence
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord
 
 from src.application.ports.event_publisher import EventPublisher
 from src.domain.events import OrderPaidEvent, ShipmentReceivedEvent
+from src.domain.exceptions import OrderNotFoundError
 from src.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -181,9 +181,18 @@ class ShipmentConsumer:
             self._settings.shipment_events_topic,
             bootstrap_servers=self._settings.kafka_bootstrap_servers,
             group_id=self._settings.kafka_consumer_group_id,
-            auto_offset_reset="latest",
-            enable_auto_commit=True,
-            # доставляем повторные/старые сообщения — Inbox их отфильтрует
+            # Стратегия чтения с бордера (покрыто тестами автотеста):
+            # * `earliest` — консьюмер стартует с начала топика и не
+            #   пропускает события, опубликованные до его подключения
+            #   (с `latest` order.shipped, пришедший за секунды до старта
+            #   воркера, терялся бы навсегда);
+            #   старые/повторные события безопасно отсекаются Inbox'ом.
+            # * авто-коммит только по успешной обработке (`commit()` после
+            #   handler'а), периодический авто-коммит выключен — при сбое
+            #   обработки offset не уходит вперёд и сообщение будет
+            #   повторено (at-least-once + идемпотентный Inbox).
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
             isolation_level="read_committed",
         )
         await consumer.start()
@@ -195,12 +204,24 @@ class ShipmentConsumer:
         try:
             async for message in consumer:
                 await self._handle_message(message)
+                # Manual commit после успешной обработки (или штатного
+                # пропуска дубликата): при исключении обработчика offset
+                # не двигается и Kafka повторит доставку — at-least-once.
+                await consumer.commit()
         finally:
             await consumer.stop()
             self._consumer = None
 
     async def _handle_message(self, message: ConsumerRecord) -> None:
-        """Обработать одно Kafka-сообщение (ошибки — только логируем)."""
+        """Обработать одно Kafka-сообщение.
+
+        Возвращается штатно при успешной обработке или идемпотентном
+        пропуске (дубликат в Inbox, недопустимый переход — use case гасит
+        их сам). Бросает исключение только если заказ ещё не виден в БД
+        (`OrderNotFoundError` — например, `order.shipped` пришёл раньше,
+        чем завершилась транзакция создания заказа): консьюмер тогда НЕ
+        коммитит offset, и брокер повторит доставку позже.
+        """
         try:
             payload = json.loads(message.value.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -220,12 +241,21 @@ class ShipmentConsumer:
 
         try:
             await self._handler(event)
-        except KafkaError:
-            logger.exception(
-                "Kafka error while handling shipment event %s",
+        except OrderNotFoundError as e:
+            # Заказ ещё не зафиксирован — не подтверждаем offset, Kafka
+            # доставит сообщение заново (at-least-once + Inbox безопасны).
+            logger.warning(
+                "Shipment event %s for unknown order %s: not committing "
+                "offset, retry will follow: %s",
                 event.event_id,
+                event.order_id,
+                e,
             )
+            raise
         except Exception:
+            # Прочие сбои обработки логируем и подтверждаем offset, чтобы
+            # не зациклить консьюмер на «битом» сообщении; дубликаты и
+            # гонки уже обработаны Inbox-идемпотентностью.
             logger.exception(
                 "Failed to handle shipment event %s (type=%s, order=%s)",
                 event.event_id,

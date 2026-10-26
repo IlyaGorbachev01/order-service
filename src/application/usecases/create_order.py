@@ -231,6 +231,12 @@ class CreateOrderUseCase:
             #    ConcurrentOrderCreationError -> повтор в _create_order.
             created = await uow.orders.create(order)
             await uow.commit()
+            if created:
+                # Уведомление о создании (NEW) — через внедрённый нотификатор;
+                # планировщик (BackgroundTasks запроса) доставит его после
+                # ответа клиенту. Для повторного идемпотентного запроса
+                # (created=False) уведомление не отправляется повторно.
+                await self._notifier.notify(order)
             return order, created
 
     async def _find_existing(self, idempotency_key: str) -> Order | None:

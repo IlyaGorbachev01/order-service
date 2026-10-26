@@ -131,11 +131,13 @@ def get_create_order_use_case(
 
     Нотификатор передаётся строго через конструктор use case (DI): сам
     use case не импортирует infrastructure и не создаёт клиентов сам.
+    Планировщиком фоновой доставки выступает BackgroundTasks текущего
+    запроса (уведомление отправляется после ответа клиенту).
     """
     return CreateOrderUseCase(
         uow,
         catalog_client,
-        notifier=dispatcher.request_notifier(background_tasks.add_task),
+        notifier=dispatcher.request_notifier(background_tasks),
         payments_client=payments_client,
         callback_url=settings.payment_callback_url,
     )
@@ -157,7 +159,7 @@ def get_process_payment_callback_use_case(
     """Создает сценарий обработки callback-а от Payments Service."""
     return ProcessPaymentCallbackUseCase(
         uow,
-        dispatcher.request_notifier(background_tasks.add_task),
+        dispatcher.request_notifier(background_tasks),
         order_events_topic=settings.order_events_topic,
     )
 

@@ -14,7 +14,7 @@ case'ы зависят только от абстрактного порта `No
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable
 
 from src.application.ports.notifications import NotificationClient
 from src.application.usecases.notify_order_status import OrderNotifier
@@ -23,30 +23,35 @@ logger = logging.getLogger(__name__)
 
 
 class InflightTracker:
-    """Учёт корутин доставки уведомлений «в полёта».
+    """Учёт задач доставки уведомлений «в полёта».
 
-    Планировщик worker-процесса оборачивает каждую корутину так, что она
-    попадает в множество `pending` до начала выполнения и снимается по
-    завершении. Это даёт graceful shutdown возможность дождаться всех
-    недоставанных уведомлений до закрытия HTTP-клиента Notifications
-    Service (иначе последние переходы статусов терялись молча).
+    Планировщик worker-процесса оборачивает каждую доставку так, что
+    asyncio.Task попадает в множество `pending` до начала выполнения и
+    снимается по завершении. Это даёт graceful shutdown возможность
+    дождаться всех недоставанных уведомлений до закрытия HTTP-клиента
+    Notifications Service (иначе последние переходы статусов терялись
+    молча).
+
+    Храним именно Task, а не корутину: `asyncio.gather` умеет ждать
+    задачи повторно даже после их завершения (завершённый gather не
+    создаёт новых задач из уже запущенных Tasks), тогда как повторный
+    gather по одной и той же корутины бросал бы
+    ``TypeError: object function can't be used in 'await' expression``
+    (см. падение консьюмера на доставке SHIPPED-уведомления).
     """
 
     def __init__(self) -> None:
-        self.pending: set[Coroutine] = set()
+        self.pending: set[asyncio.Task] = set()
 
     def schedule(self, coro: Awaitable[None]) -> None:
         """Поставить корутину фоновой задачей в текущем event loop."""
-        task = asyncio.get_running_loop().create_task(self._track(coro))
-        # Страховка: исключение фоновой задачи не должно теряться молча.
-        task.add_done_callback(self._log_error)
+        task = asyncio.ensure_future(coro)
+        self.pending.add(task)
+        task.add_done_callback(self._done)
 
-    async def _track(self, coro: Awaitable[None]) -> None:
-        self.pending.add(coro)
-        try:
-            await coro
-        finally:
-            self.pending.discard(coro)
+    def _done(self, task: asyncio.Task) -> None:
+        self.pending.discard(task)
+        self._log_error(task)
 
     @staticmethod
     def _log_error(task: asyncio.Task) -> None:
@@ -82,17 +87,19 @@ class NotificationDispatcher:
             self._notifier = OrderNotifier(self._client, scheduler=scheduler)
         return self._notifier
 
-    def request_notifier(
-        self, background_add_task: Callable[..., None]
-    ) -> OrderNotifier:
+    def request_notifier(self, background: object) -> OrderNotifier:
         """Собрать нотификатор на текущий HTTP-запрос.
 
-        Планировщиком выступает `BackgroundTasks.add_task`: доставка
-        выполняется после отправки ответа клиенту и гарантированно не
-        теряется при сборке GC (прежний потоковый event loop для этого не
-        нужен). Ошибки доставки гасятся внутри OrderNotifier (best-effort).
+        Планировщиком выступает `BackgroundTasks` (FastAPI/starlette):
+        доставка выполняется после отправки ответа клиенту и гарантированно
+        не теряется при сборке GC (прежний потоковый event loop для этого
+        не нужен). Ошибки доставки гасятся внутри OrderNotifier
+        (best-effort).
         """
-        return OrderNotifier(self._client, scheduler=background_add_task)
+        add_task = getattr(background, "add_task", None)
+        if not callable(add_task):  # pragma: no cover - защита от misuse
+            raise TypeError("background must provide add_task()")
+        return OrderNotifier(self._client, scheduler=add_task)
 
     async def wait_pending(self) -> None:
         """Дождаться завершения всех отложенных отправок (graceful shutdown)."""

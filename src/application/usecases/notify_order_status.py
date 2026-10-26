@@ -1,7 +1,9 @@
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from typing import Any
 
 from src.application.ports.notifications import (
     NotificationClient,
@@ -74,6 +76,21 @@ class OrderNotifier(NotificationPort):
 
         Не бросает исключений и безопасна из любого контекста
         (HTTP-обработчик, консьюмер Kafka, тест).
+
+        Планирование зависит от типа планировщика (определяется по
+        сигнатуре `add_task`, без импортов presentation/infrastructure):
+
+        - ``BackgroundTasks.add_task`` (HTTP-процесс): принимает СИНХРОННЫЙ
+          коллбэк, который starlette выполняет через run_in_threadpool
+          ПОСЛЕ отправки ответа; передача корутины привела бы к
+          TypeError ("the first argument must be callable") уже после
+          ответа клиенту — так терялись уведомления NEW/PAID (провалившийся
+          шаг автотеста: 3 ожидаемых уведомления, получено 2). Поэтому в
+          background кладётся sync-обёртка `_spawn_or_run`, которая заводит
+          доставку task'ом обратно в основной event loop процесса.
+        - иной планировщик (worker-процесс: InflightTracker.schedule,
+          ожидающий корутину): доставляем корутиной напрямую — тот же
+          event loop, без лишних потоков и перепланирования.
         """
         if self._client is None:
             logger.debug(
@@ -84,32 +101,27 @@ class OrderNotifier(NotificationPort):
             return
         request = self._build_request(order)
         if self._scheduler is not None:
-            # Фоновый режим (BackgroundTasks / create_task): задача
-            # гарантированно доходит до планировщика, ошибка доставки не
-            # влияет на основной сценарий.
-            #
-            # ВАЖНО: `BackgroundTasks.add_task` принимает СИНХРОННЫЙ
-            # коллбэк (func(*args)), который starlette выполняет через
-            # run_in_threadpool; передача корутины привела бы к
-            # TypeError ("the first argument must be callable") уже после
-            # отправки ответа. Поэтому в фоне планируем обычный sync
-            # коллбэк, который заводит доставку task'ом в работающем
-            # event loop (fire-and-forget) и страхует ошибку loop'а
-            # синхронным best-effort прогоном в потоке threadpool.
-            def _background_deliver(
-                req: NotificationRequest = request, oid: str = order.id
-            ) -> None:
-                self._spawn_or_run(req, oid)
+            if self._is_starlette_background(self._scheduler):
+                # Фоновый режим HTTP-запроса: sync-коллбэк в threadpool,
+                # доставка — task'ом в основном loop (см. docstring).
+                def _background_deliver(
+                    req: NotificationRequest = request, oid: str = order.id
+                ) -> None:
+                    self._spawn_or_run(req, oid)
 
+                planned: Any = _background_deliver
+            else:
+                # Worker-процесс: трекер ждёт именно корутину доставки.
+                planned = self._deliver(request, order.id)
             try:
-                self._scheduler(_background_deliver)
+                self._scheduler(planned)
                 return
             except Exception:  # pragma: no cover - отказ планировщика
                 logger.exception(
                     "Notification scheduler failed for order %s; delivering inline",
                     order.id,
                 )
-                # Коррутина могла быть «съедена» планировщиком — пересобираем.
+                # Корутина могла быть «съедена» планировщиком — пересобираем.
                 request = self._build_request(order)
         # Синхронный фолбэк: планировщика нет, но event loop запущен —
         # доставляем прямо здесь (best-effort, ошибки только логируются).
@@ -124,6 +136,27 @@ class OrderNotifier(NotificationPort):
             )
             return
         await self._deliver(request, order.id)
+
+    @staticmethod
+    def _is_starlette_background(add_task: Callable[..., Any]) -> bool:
+        """Отличить `BackgroundTasks.add_task` от обычного планировщика.
+
+        У starlette/FastAPI `add_task` принимает первым именованным
+        параметром `func` плюс `*args/**kwargs`; у наших планировщиков
+        (InflightTracker.schedule) — единственный позиционный параметр
+        корутины. Проверка по сигнатуре не создаёт импорт presentation
+        или starlette в application-слое.
+        """
+        try:
+            params = inspect.signature(add_task).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtins/C-func
+            return False
+        values = list(params.values())
+        return (
+            bool(values)
+            and values[0].name == "func"
+            and any(p.kind is p.VAR_POSITIONAL for p in values)
+        )
 
     # --- доставка -------------------------------------------------------------
 

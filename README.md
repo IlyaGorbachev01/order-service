@@ -146,11 +146,9 @@ CAPASHINO_API_TOKEN=<token> docker compose up --build
 ```
 
 Локально без Kafka работают REST-эндпоинты и интеграции с Capashino. Outbox-воркер и
-консьюмер Shipping Service запускаются **отдельным процессом** (не фоновой корутиной
-внутри API): контейнер `worker` в docker-compose выполняет `run-worker.sh` →
-`python -m src.bin.worker`. В кластере — второй Deployment/контейнер того же образа
-с той же командой и теми же переменными окружения (`DATABASE_URL`,
-`KAFKA_BOOTSTRAP_SERVERS`).
+консьюмер Shipping Service — это **отдельный процесс** `python -m src.bin.worker`
+(не фоновая корутина внутри API; lifespan HTTP-сервиса их не поднимает).
+В docker-compose его запускает контейнер `worker` через `run-worker.sh`.
 
 ## Деплой (LMS / Kubernetes)
 
@@ -158,9 +156,22 @@ CAPASHINO_API_TOKEN=<token> docker compose up --build
    LMS деплоит в namespace студента).
 2. В разделе «Переменные окружения» сервиса укажите обязательные переменные из таблицы выше
    (см. также уже настроенные `POSTGRES_*`).
-3. При старте пода `run.sh` выполняет `alembic upgrade head`, затем запускает
-   `uvicorn src.main:app` на порту 8000.
-4. Проверьте доступность: `GET /openapi.json` должен отвечать 200.
+3. При старте пода `run.sh` выполняет `alembic upgrade head`, затем:
+   - запускает воркер **отдельным дочерним процессом** (`python -m src.bin.worker`:
+     outbox-relay + Kafka-consumer), следит за ним и перезапускает при падении;
+   - запускает `uvicorn src.main:app` на порту 8000.
+   Это нужно потому, что LMS разворачивает только один Deployment (web) — второго
+   контейнера/деплоя для воркера платформой не предусмотрено. Флаг `RUN_WORKER=false`
+   отключает дочерний воркер (для случая отдельного Deployment'а с `run-worker.sh`).
+   При нескольких репликах web-пода дублирование публикаций исключено: партии outbox
+   захватываются транзакцией `FOR UPDATE SKIP LOCKED`, а входящие события дедуплицирует
+   Inbox.
+4. Проверьте доступность: `GET /openapi.json` должен отвечать 200, а в логах пода —
+   строки `Outbox worker started` и `Shipment consumer started` (это подтверждает,
+   что фоновые компоненты живут в отдельном процессе).
+5. Если автотест зависает на `Shipment not found` — проверьте, доходят ли до сервиса
+   события топика `student_system-shipment.events` (в логах воркера должны быть
+   `Published N outbox event(s)` и обработка `order.shipped`).
 
 ## Миграции
 

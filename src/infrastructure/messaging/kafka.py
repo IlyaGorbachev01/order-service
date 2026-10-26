@@ -142,7 +142,7 @@ class ShipmentConsumer:
         self._stopping = False
         self._task = asyncio.create_task(self._run(), name="shipment-consumer")
         logger.info(
-            "Shipment consumer task started (topic=%s, group=%s)",
+            "Shipment consumer started (topic=%s, group=%s)",
             self._settings.shipment_events_topic,
             self._settings.kafka_consumer_group_id,
         )

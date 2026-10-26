@@ -80,9 +80,51 @@ class CreateOrderUseCase:
             # Платёж создаём только для нового заказа: повторный запрос с тем же
             # idempotency_key возвращает исходный заказ без побочных эффектов.
             if self._payments_client is not None:
-                amount = await self._resolve_amount(order)
-                order = await self._create_payment(order, amount, self._callback_url)
+                try:
+                    amount = await self._resolve_amount(order)
+                    order = await self._create_payment(
+                        order, amount, self._callback_url
+                    )
+                except PaymentServiceError as e:
+                    # Платёжный сбой — побочный эффект, а не отказ валидации:
+                    # заказ уже сохранён и отменён (CANCELLED), основной ответ
+                    # остаётся успешным 201 по спецификации. Иначе недоступный
+                    # Payments превращал happy-path в 5xx (провалившийся шаг
+                    # автотеста order_create_success). Причина логируется и
+                    # видна в Sentry как handled-исключение.
+                    logger.warning(
+                        "Order %s created but payment failed; returning 201 "
+                        "with cancelled order: %s",
+                        order.id,
+                        e,
+                    )
+                    order = await self._reload_order(order.id) or order
+                except (ItemNotFoundError, CatalogUnavailableError) as e:
+                    # Товар «исчез» из каталога между проверкой стока и
+                    # расчётом суммы либо Catalog Service стал недоступен.
+                    # Это тоже сбой зависимого сервиса на этапе платежа:
+                    # отменяем заказ и возвращаем 201 с CANCELLED — тест
+                    # может повторить запрос с новым idempotency_key.
+                    logger.warning(
+                        "Order %s: catalog failure during payment step (%s); "
+                        "cancelling order and returning 201.",
+                        order.id,
+                        e,
+                    )
+                    await self._cancel_order(
+                        order.id, reason=f"Catalog failure at payment step: {e}"
+                    )
+                    order = await self._reload_order(order.id) or order
         return order
+
+    async def _reload_order(self, order_id: str) -> Order | None:
+        """Прочитать актуальное состояние заказа (для ответа после сбоя)."""
+        try:
+            async with self._uow() as uow:
+                return await uow.orders.get_by_id(order_id)
+        except Exception:  # pragma: no cover - best-effort перечитывание
+            logger.exception("Failed to reload order %s", order_id)
+            return None
 
     async def _create_order(self, command: CreateOrderCommand) -> tuple[Order, bool]:
         """Сохранить заказ NEW; вернуть (заказ, был_ли_он_создан_этим_запросом).

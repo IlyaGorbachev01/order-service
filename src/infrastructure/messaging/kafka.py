@@ -127,13 +127,27 @@ class ShipmentConsumer:
         handler: EventHandler,
         *,
         retry_interval: float = 5.0,
+        poison_threshold: int = 3,
+        poison_pause: float = 120.0,
     ):
         self._settings = settings
         self._handler = handler
         self._retry_interval = retry_interval
+        # Защита от «отравленного» сообщения: если одно и то же событие
+        # не удаётся доставить `poison_threshold` раз подряд (например,
+        # заказ уже удалён из БД, а Shipping пересылает своё событие),
+        # консьюмер пропускает его (commit offset) и делает паузу
+        # `poison_pause` секунд — иначе цикл ретраев блокирует обработку
+        # всех остальных событий партиции навсегда.
+        self._poison_threshold = poison_threshold
+        self._poison_pause = poison_pause
         self._task: asyncio.Task | None = None
         self._consumer: AIOKafkaConsumer | None = None
         self._stopping = False
+        # Состояние защиты от «отравленного» сообщения (переживает
+        # переподключения консьюмера): (partition, offset) + счётчик неудач.
+        self._last_failed_offset: tuple[int, int] | None = None
+        self._fail_count = 0
 
     async def start(self) -> None:
         """Запустить фоновую задачу потребления (не блокирует старт приложения)."""
@@ -163,7 +177,15 @@ class ShipmentConsumer:
         logger.info("Shipment consumer stopped")
 
     async def _run(self) -> None:
-        """Цикл с переподключением: сбой брокера не должен убивать консьюмер."""
+        """Цикл с переподключением: сбой брокера не должен убивать консьюмер.
+
+        Обработка «отравленного» сообщения (не обрабатывается подряд
+        `poison_threshold` раз): offset пропускается, чтобы цикл ретраев
+        одного битого события не блокировал всю партицию; затем пауза
+        `poison_pause`, за которую новые события обрабатываются нормально.
+        Состояние (offset + счётчик неудач) живёт в экземпляре и переживает
+        переподключения.
+        """
         while not self._stopping:
             try:
                 await self._consume_loop()
@@ -203,11 +225,45 @@ class ShipmentConsumer:
         )
         try:
             async for message in consumer:
-                await self._handle_message(message)
+                current = (message.partition, message.offset)
+                if (
+                    self._last_failed_offset is not None
+                    and current != self._last_failed_offset
+                ):
+                    # Смещаемся от «битого» сообщения — счётчик неудач сбрасываем.
+                    self._last_failed_offset = None
+                    self._fail_count = 0
+                try:
+                    await self._handle_message(message)
+                except OrderNotFoundError:
+                    self._fail_count += 1
+                    self._last_failed_offset = current
+                    if self._fail_count < self._poison_threshold:
+                        # Заказ, скорее всего, ещё не закоммичен — прерываем
+                        # цикл и переподключаемся; Kafka переотправит сообщение
+                        # с несохранённого offset (at-least-once).
+                        return
+                    # Отравленное сообщение: пропускаем offset и делаем паузу,
+                    # чтобы не блокировать партицию бесконечными ретраями.
+                    logger.error(
+                        "Shipment event at partition=%s offset=%s failed "
+                        "%d times in a row; skipping it and pausing %.0fs",
+                        message.partition,
+                        message.offset,
+                        self._fail_count,
+                        self._poison_pause,
+                    )
+                    await consumer.commit()
+                    self._last_failed_offset = None
+                    self._fail_count = 0
+                    await asyncio.sleep(self._poison_pause)
+                    continue
                 # Manual commit после успешной обработки (или штатного
                 # пропуска дубликата): при исключении обработчика offset
                 # не двигается и Kafka повторит доставку — at-least-once.
                 await consumer.commit()
+                self._last_failed_offset = None
+                self._fail_count = 0
         finally:
             await consumer.stop()
             self._consumer = None

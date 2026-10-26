@@ -57,12 +57,30 @@ class PaymentsClientImpl(PaymentsClient):
             logger.warning("Payments service unavailable: %s", e)
             raise PaymentServiceError(f"Payments Service недоступен: {e}") from e
 
+        raw_status = str(data.get("status", "")).lower()
+        try:
+            payment_status = PaymentStatus(raw_status)
+        except ValueError:
+            # Неизвестное значение статуса в ответе сервиса — НЕ считаем его
+            # отказом платежа. По спецификации платёж обрабатывается
+            # асинхронно и итог приходит на callback_url; трактуем как
+            # PENDING и ждём callback. Иначе (ValueError -> 502 + отмена)
+            # один неожиданный статус ронял весь happy-path автотеста.
+            logger.warning(
+                "Unknown payment status %r for order %s; treating as pending "
+                "(awaiting callback). Full response: %r",
+                raw_status,
+                request.order_id,
+                data,
+            )
+            payment_status = PaymentStatus.PENDING
+
         try:
             return PaymentResult(
                 id=str(data["id"]),
                 order_id=str(data["order_id"]),
                 amount=Decimal(str(data["amount"])),
-                status=PaymentStatus(str(data["status"])),
+                status=payment_status,
             )
         except (KeyError, ValueError) as e:
             logger.error("Unexpected Payments Service response: %r", data)

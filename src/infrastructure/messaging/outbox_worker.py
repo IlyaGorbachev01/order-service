@@ -1,18 +1,31 @@
-"""Outbox-воркер: надёжная доставка событий из таблицы Outbox в Kafka.
+"""Outbox-воркер: надёжная доставка записей из таблицы Outbox.
+
+Единый механизм доставки всех побочных эффектов (at-least-once): воркер
+разбирает захваченные записи по назначению (`OutboxEventType`):
+
+- ``kafka_event``  — публикация в Kafka-топик из записи (событие
+  ``order.paid`` для Shipping Service);
+- ``notification`` — HTTP-доставка через клиент Notifications Service:
+  payload разбирается в :class:`NotificationCommand`, текст сообщения и
+  детерминированный ключ идемпотентности ``{order_id}:{status}``
+  формируются доменными функциями (см. ``domain.notifications``).
 
 Цикл воркера:
 
 1. *захватывает* партию неотправленных записей `outbox_events` транзакцией
    с `FOR UPDATE SKIP LOCKED` (PostgreSQL) — одна запись не обрабатывается
    двумя экземплярами воркера одновременно;
-2. публикует каждую в Kafka (подтверждённая доставка, `acks=all`);
+2. доставляет каждую по её типу (Kafka / HTTP Notifications);
 3. помечает успешно отправленные `published = True` в той же транзакции
    захвата и завершает её.
 
 Гарантия — at-least-once: если процесс упадёт после публикации, но до
-коммита пометки, блокировка снимется и событие будет опубликовано
-повторно; потребители (Shipping Service) идемпотентны по
-`idempotency_key`/ID события.
+коммита пометки (или при ошибке доставки запись вообще не помечается),
+блокировка снимется и событие будет доставлено повторно; потребители
+идемпотентны: Shipping — по `idempotency_key`/ID события, Notifications —
+по детерминированному ключу `{order_id}:{status}`. Ошибки Notifications
+Service не ломают основной поток: use case ничего не отправляет сам, а
+ретраи происходят в цикле воркера.
 
 Воркер запускается двумя способами (см. `src/bin/worker.py`):
 
@@ -30,6 +43,18 @@ import logging
 from collections.abc import Callable
 
 from src.application.ports.event_publisher import EventPublisher
+from src.application.ports.notifications import (
+    NotificationClient,
+    NotificationRequest,
+)
+from src.application.ports.repositories import OutboxRecord
+from src.domain.entities import OrderStatus
+from src.domain.events import NotificationCommand, OutboxEventType
+from src.domain.notifications import (
+    normalize_user_id,
+    notification_idempotency_key,
+    notification_message,
+)
 from src.infrastructure.persistence.uow import UnitOfWorkImpl
 from src.settings import Settings
 
@@ -37,7 +62,13 @@ logger = logging.getLogger(__name__)
 
 
 class OutboxWorker:
-    """Публикатор событий из Outbox (безопасен для нескольких экземпляров)."""
+    """Публикатор событий из Outbox (безопасен для нескольких экземпляров).
+
+    Назначение записи определяет способ доставки (`OutboxEventType`):
+    ``kafka_event`` -> Kafka-продюсер, ``notification`` -> HTTP-клиент
+    Notifications Service. Оба пути — at-least-once: при ошибке запись
+    не помечается доставленной и будет повторена в следующем цикле.
+    """
 
     def __init__(
         self,
@@ -45,10 +76,12 @@ class OutboxWorker:
         publisher: EventPublisher,
         settings: Settings,
         *,
+        notifications_client: NotificationClient | None = None,
         batch_size: int = 50,
     ):
         self._uow_factory = uow_factory
         self._publisher = publisher
+        self._notifications_client = notifications_client
         self._poll_interval = settings.outbox_poll_interval
         self._batch_size = batch_size
         self._task: asyncio.Task | None = None
@@ -94,17 +127,16 @@ class OutboxWorker:
                 )
 
     async def publish_pending_once(self) -> int:
-        """Один цикл: захватить партию outbox-событий и опубликовать их.
+        """Один цикл: захватить партию outbox-записей и доставить их.
 
-        Возвращает число опубликованных событий. Пустой цикл — no-op.
+        Возвращает число доставленных записей. Пустой цикл — no-op.
 
         Транзакция захвата (`claim_pending` → FOR UPDATE SKIP LOCKED на
-        PostgreSQL) остаётся открытой на время публикации и закрывается
+        PostgreSQL) остаётся открытой на время доставки и закрывается
         коммитом пометки `published = True`. Это делает воркера пригодным
-        к горизонтальному масштабированию: несколько экземпляров (копии
-        Deployment'а API или отдельные процессы `src/bin/outbox_worker.py`)
-        не обрабатывают одну запись одновременно. При сбое до коммита
-        блокировка снимается и событие повторяется (at-least-once).
+        к горизонтальному масштабированию: несколько экземпляров не
+        обрабатывают одну запись одновременно. При сбое до коммита
+        блокировка снимается и запись повторяется (at-least-once).
         """
         uow = self._uow_factory()
         async with uow:
@@ -114,14 +146,10 @@ class OutboxWorker:
             published_ids: list[int] = []
             for record in records:
                 try:
-                    await self._publisher.publish_raw(
-                        topic=record.topic,
-                        key=record.aggregate_id,
-                        payload=record.payload,
-                    )
+                    await self._deliver(record)
                 except Exception:
                     logger.exception(
-                        "Failed to publish outbox record %s (%s), will retry",
+                        "Failed to deliver outbox record %s (%s), will retry",
                         record.id,
                         record.event_type,
                     )
@@ -131,5 +159,53 @@ class OutboxWorker:
             if published_ids:
                 await uow.outbox.mark_published(published_ids)
                 await uow.commit()
-                logger.info("Published %d outbox event(s)", len(published_ids))
+                logger.info("Delivered %d outbox event(s)", len(published_ids))
             return len(published_ids)
+
+    async def _deliver(self, record: OutboxRecord) -> None:
+        """Доставить одну запись outbox в зависимости от её типа.
+
+        - ``notification`` -> HTTP-клиент Notifications Service;
+        - всё остальное (``kafka_event``) -> Kafka-топик из записи.
+
+        Любая ошибка доставки пробрасывается наружу: вызывающий цикл не
+        помечает запись доставленной, и она будет повторена позже.
+        """
+        if record.event_type == OutboxEventType.NOTIFICATION:
+            await self._deliver_notification(record)
+            return
+        await self._publisher.publish_raw(
+            topic=record.topic,
+            key=record.aggregate_id,
+            payload=record.payload,
+        )
+
+    async def _deliver_notification(self, record: OutboxRecord) -> None:
+        """Отправить уведомление из payload'а команды NotificationCommand.
+
+        Текст сообщения и ключ идемпотентности `{order_id}:{status}`
+        формируются доменными функциями — один источник правды; повторная
+        доставка тем же ключом не создаёт дубликат на стороне сервиса.
+        """
+        if self._notifications_client is None:
+            raise RuntimeError(
+                "Outbox worker received a NOTIFICATION record but no "
+                "notifications client was configured."
+            )
+        command = NotificationCommand.from_payload(record.payload)
+        try:
+            status = OrderStatus(command.status)
+        except ValueError as e:
+            # Повреждённый/неизвестный статус в payload — такие записи
+            # пишет только наш же use case, поэтому это аномалия данных:
+            # пробрасываем ошибку наружу, запись не помечается доставленной.
+            raise ValueError(
+                f"Unknown order status in notification payload: {command.status!r}"
+            ) from e
+        request = NotificationRequest(
+            message=notification_message(status, reason=command.reason),
+            user_id=normalize_user_id(command.user_id),
+            reference_id=command.order_id,
+            idempotency_key=notification_idempotency_key(command.order_id, status),
+        )
+        await self._notifications_client.send_notification(request)

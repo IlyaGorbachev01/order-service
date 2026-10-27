@@ -2,12 +2,11 @@ import logging
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import BackgroundTasks, Depends
+from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.application.usecases.create_order import CreateOrderUseCase
 from src.application.usecases.get_order import GetOrderUseCase
-from src.application.usecases.notification_dispatcher import NotificationDispatcher
 from src.application.usecases.process_payment_callback import (
     ProcessPaymentCallbackUseCase,
 )
@@ -93,51 +92,24 @@ NotificationsClientDep = Annotated[
 ]
 
 
-# --- Диспетчер уведомлений (синглтон уровня приложения) ---
-# Все use case'ы используют ОДИН OrderNotifier: фоновые задачи отправки
-# переживают завершение HTTP-запроса; конкретный планировщик доставки
-# (BackgroundTasks.add_task) подставляется на каждый запрос в роутах —
-# см. get_create_order_use_case / get_process_payment_callback_use_case.
-
-_notification_dispatcher_singleton: NotificationDispatcher | None = None
-
-
-def _get_notification_dispatcher(settings: SettingsDep) -> NotificationDispatcher:
-    global _notification_dispatcher_singleton
-    if _notification_dispatcher_singleton is None:
-        _notification_dispatcher_singleton = NotificationDispatcher(
-            _get_notifications_client(settings)
-        )
-    return _notification_dispatcher_singleton
-
-
-NotificationDispatcherDep = Annotated[
-    NotificationDispatcher, Depends(_get_notification_dispatcher)
-]
-
-
 # --- Фабрики use case'ов ---
+# Уведомления доставляются через transactional outbox: use case пишет
+# запись NOTIFICATION в той же транзакции, что и смена статуса заказа,
+# а фактическую HTTP-отправку выполняет outbox-воркер (отдельный процесс,
+# см. src/bin/worker.py). Поэтому здесь больше нет ни OrderNotifier,
+# ни NotificationDispatcher, ни планировщика BackgroundTasks.
 
 
 def get_create_order_use_case(
-    background_tasks: BackgroundTasks,
     uow: UowDep,
     catalog_client: CatalogClientDep,
     payments_client: PaymentsClientDep,
-    dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
 ) -> CreateOrderUseCase:
-    """Создает сценарий оформления заказа (оплата + уведомления).
-
-    Нотификатор передаётся строго через конструктор use case (DI): сам
-    use case не импортирует infrastructure и не создаёт клиентов сам.
-    Планировщиком фоновой доставки выступает BackgroundTasks текущего
-    запроса (уведомление отправляется после ответа клиенту).
-    """
+    """Создает сценарий оформления заказа (оплата + уведомления через outbox)."""
     return CreateOrderUseCase(
         uow,
         catalog_client,
-        notifier=dispatcher.request_notifier(background_tasks),
         payments_client=payments_client,
         callback_url=settings.payment_callback_url,
     )
@@ -151,15 +123,12 @@ def get_get_order_use_case(
 
 
 def get_process_payment_callback_use_case(
-    background_tasks: BackgroundTasks,
     uow: UowDep,
-    dispatcher: NotificationDispatcherDep,
     settings: SettingsDep,
 ) -> ProcessPaymentCallbackUseCase:
     """Создает сценарий обработки callback-а от Payments Service."""
     return ProcessPaymentCallbackUseCase(
         uow,
-        dispatcher.request_notifier(background_tasks),
         order_events_topic=settings.order_events_topic,
     )
 
@@ -196,12 +165,6 @@ async def shutdown_resources() -> None:
     global _catalog_client_singleton, _payments_client_singleton
     global _notifications_client_singleton
     global _kafka_publisher_singleton
-    global _notification_dispatcher_singleton
-    # Сначала дожидаемся фоновых отправок уведомлений — они используют
-    # HTTP-клиент Notifications Service, который закрывается ниже.
-    if _notification_dispatcher_singleton is not None:
-        await _notification_dispatcher_singleton.wait_pending()
-        _notification_dispatcher_singleton = None
     if _kafka_publisher_singleton is not None:
         await _kafka_publisher_singleton.stop()
         _kafka_publisher_singleton = None

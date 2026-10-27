@@ -4,11 +4,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Protocol
 
 from src.application.ports.catalog import CatalogClient, CatalogItem
 from src.application.ports.payments import PaymentRequest, PaymentsClient
 from src.application.ports.uow import BaseUnitOfWork
+from src.application.usecases.notify_order_status import enqueue_status_notification
 from src.domain.entities import Order, OrderStatus, PaymentStatus
 from src.domain.exceptions import (
     CatalogUnavailableError,
@@ -24,23 +24,6 @@ logger = logging.getLogger(__name__)
 # Повторы при гонке на уникальном индексе idempotency_key
 _MAX_IDEMPOTENCY_RETRIES = 3
 _RETRY_BACKOFF_SECONDS = 0.05
-
-
-class NotificationPort(Protocol):
-    """Порт отправки уведомлений о смене статуса заказа.
-
-    Use case зависит только от этого абстрактного контракта (правило
-    зависимостей чистой архитектуры): конкретная реализация
-    (`OrderNotifier`) передаётся строго извне — через композицию корня
-    (`presentation/api/dependencies.py`, `src/bin/worker.py`). Никаких
-    импортов infrastructure и httpx здесь нет: HTTP-детали внешних
-    сервисов полностью транслируются в доменные исключения внутри
-    `infrastructure/http/`.
-    """
-
-    async def notify(self, order: Order) -> None:
-        """Поставить уведомление о текущем статусе заказа (best-effort)."""
-        ...
 
 
 @dataclass
@@ -71,7 +54,6 @@ class CreateOrderUseCase:
         self,
         uow: BaseUnitOfWork,
         catalog_client: CatalogClient,
-        notifier: NotificationPort,
         payments_client: PaymentsClient | None = None,
         callback_url: str = "",
     ):
@@ -79,9 +61,10 @@ class CreateOrderUseCase:
         self._catalog_client = catalog_client
         self._payments_client = payments_client
         self._callback_url = callback_url
-        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
-        # создаёт инфраструктурные реализации сам и ничего о них не знает.
-        self._notifier = notifier
+        # Уведомления НЕ внедряются в виде клиента: use case пишет запись
+        # NOTIFICATION в outbox (`uow.outbox`) в той же транзакции, что и
+        # смену статуса — at-least-once доставка через единый механизм
+        # (см. notify_order_status.enqueue_status_notification).
 
     async def __call__(self, command: CreateOrderCommand) -> tuple[Order, bool]:
         """Выполнить сценарий создания заказа.
@@ -226,17 +209,19 @@ class CreateOrderUseCase:
                 updated_at=now,
             )
 
-            # 4. Сохранение заказа в статусе NEW + явный коммит (см. docstring)
+            # 4. Сохранение заказа в статусе NEW + уведомление о NEW — ОДНОЙ
+            #    транзакцией (атомарно: либо заказ создан и уведомление
+            #    поставлено в очередь, либо откат обоих). Затем явный коммит
+            #    (см. docstring).
             #    Нарушение unique по idempotency_key бросает
             #    ConcurrentOrderCreationError -> повтор в _create_order.
             created = await uow.orders.create(order)
-            await uow.commit()
             if created:
-                # Уведомление о создании (NEW) — через внедрённый нотификатор;
-                # планировщик (BackgroundTasks запроса) доставит его после
-                # ответа клиенту. Для повторного идемпотентного запроса
-                # (created=False) уведомление не отправляется повторно.
-                await self._notifier.notify(order)
+                # Уведомление о создании (NEW) — через transactional outbox.
+                # Для повторного идемпотентного запроса (created=False)
+                # уведомление не ставится повторно.
+                await enqueue_status_notification(uow.outbox, order)
+            await uow.commit()
             return order, created
 
     async def _find_existing(self, idempotency_key: str) -> Order | None:
@@ -366,10 +351,11 @@ class CreateOrderUseCase:
                     result.id,
                     updated.status.value,
                 )
-                # Уведомление о синхронном итоге платежа (PAID/CANCELLED).
-                # Для PENDING итог придёт на callback и будет отправлен там.
+                # Уведомление о синхронном итоге платежа (PAID/CANCELLED) —
+                # в ту же транзакцию, что и update() заказа (атомарно).
+                # Для PENDING итог придёт на callback и будет поставлен там.
                 if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
-                    await self._notifier.notify(updated)
+                    await enqueue_status_notification(uow.outbox, updated)
                 return updated
         except PaymentServiceError:
             raise
@@ -395,10 +381,11 @@ class CreateOrderUseCase:
                 return
             order.mark_cancelled(reason=reason)
             updated = await uow.orders.update(order)
+            # Уведомление об отмене (CANCELLED) — в ту же транзакцию, что и
+            # смена статуса: атомарно, доставка через outbox-воркер.
+            await enqueue_status_notification(uow.outbox, updated)
             await uow.commit()
             logger.info("Order %s cancelled: %s", order_id, reason)
-            # Уведомление об отмене заказа (CANCELLED).
-            await self._notifier.notify(updated)
 
     @staticmethod
     def _build_payment_idempotency_key(order_id: str) -> str:

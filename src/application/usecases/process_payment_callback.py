@@ -2,7 +2,7 @@ import logging
 
 from src.application.ports.repositories import OutboxRepository
 from src.application.ports.uow import BaseUnitOfWork
-from src.application.usecases.create_order import NotificationPort
+from src.application.usecases.notify_order_status import enqueue_status_notification
 from src.domain.entities import PaymentCallback
 from src.domain.events import ORDER_PAID_EVENT, OrderPaidEvent
 from src.domain.exceptions import (
@@ -83,15 +83,14 @@ class ProcessPaymentCallbackUseCase:
     def __init__(
         self,
         uow: BaseUnitOfWork,
-        notifier: NotificationPort,
         *,
         order_events_topic: str = "",
     ):
         self._uow = uow
         self._order_events_topic = order_events_topic
-        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
-        # создаёт инфраструктурные реализации сам и ничего о них не знает.
-        self._notifier = notifier
+        # Уведомления доставляются через transactional outbox (запись
+        # NOTIFICATION в той же транзакции, что и смена статуса) —
+        # best-effort нотификатор из памяти процесса больше не нужен.
 
     async def __call__(self, callback: PaymentCallback) -> None:
         """Обработать callback платежа.
@@ -155,7 +154,12 @@ class ProcessPaymentCallbackUseCase:
                     idempotency_key=order.idempotency_key or callback.payment_id,
                 )
 
-            # 5. Атомарно сохранить заказ и факт обработки callback-а
+            # 5. Уведомление о новом статусе (PAID/CANCELLED) — в ЭТУ ЖЕ
+            #    транзакцию (атомарно со сменой статуса и записью callback-а):
+            #    доставка через outbox-воркер, переживает любой рестарт.
+            await enqueue_status_notification(uow.outbox, order)
+
+            # 6. Атомарно сохранить заказ и факт обработки callback-а
             await uow.orders.update(order)
             try:
                 await uow.payment_callbacks.save(callback)
@@ -176,8 +180,3 @@ class ProcessPaymentCallbackUseCase:
                 order.status.value,
                 callback.payment_id,
             )
-
-        # Уведомление о новом статусе (PAID/CANCELLED) — после коммита
-        # транзакции, чтобы не отправлять уведомление при последующем откате.
-        # OrderNotifier перехватывает ошибки сервиса и лишь логирует их.
-        await self._notifier.notify(order)

@@ -48,6 +48,7 @@ class Order:
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
     payment_id: str | None = None
+    cancel_reason: str | None = None
 
     def can_be_cancelled(self) -> bool:
         """Бизнес-правило: отменить можно только NEW или PAID."""
@@ -83,15 +84,6 @@ class Order:
         self.transition_to(OrderStatus.CANCELLED)
         if reason:
             self.cancel_reason = reason
-
-    @property
-    def cancel_reason(self) -> str | None:
-        """Причина отмены заказа (если заказ был отменён с указанием причины)."""
-        return getattr(self, "_cancel_reason", None)
-
-    @cancel_reason.setter
-    def cancel_reason(self, value: str) -> None:
-        self._cancel_reason = value
 
 
 @dataclass(frozen=True)

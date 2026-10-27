@@ -8,11 +8,17 @@ from src.domain.events import ShipmentReceivedEvent
 
 @dataclass(frozen=True)
 class OutboxRecord:
-    """Запись таблицы Outbox, готовая к публикации в Kafka.
+    """Запись таблицы Outbox, готовая к доставке (Kafka или Notifications).
 
     Value object уровня портов: инфраструктурная реализация репозитория
     отображает в него свои SQLAlchemy-модели, чтобы use cases и воркеры не
     зависели от деталей персистентности.
+
+    Назначение записи определяет `event_type` (`OutboxEventType`):
+    - `kafka_event`  — payload публикуется в Kafka-топик `topic`;
+    - `notification` — payload разбирается в `NotificationCommand` и
+      доставляется HTTP-клиентом Notifications Service (`topic` не
+      используется, кладётся пустая строка).
     """
 
     id: int
@@ -34,8 +40,13 @@ class OrderRepository(ABC):
         """Получить заказ по ключу идемпотентности."""
 
     @abstractmethod
-    async def create(self, order: Order) -> Order:
-        """Создать новый заказ."""
+    async def create(self, order: Order) -> bool:
+        """Создать новый заказ.
+
+        Возвращает True, если заказ создан этим вызовом, и False, если
+        заказ с таким `idempotency_key` уже существовал (идемпотентный
+        повтор).
+        """
 
     @abstractmethod
     async def update(self, order: Order) -> Order:

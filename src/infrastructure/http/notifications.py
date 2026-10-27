@@ -32,8 +32,9 @@ class NotificationsClientImpl(NotificationClient):
         payload = {
             "message": request.message,
             # Notifications Service ожидает UUID получателя; нормализация
-            # выполняется на границе отправки (см. OrderNotifier.notify),
-            # здесь просто передаём user_id из запроса.
+            # выполняется на границе отправки (outbox-воркер формирует
+            # NotificationRequest через domain.normalize_user_id), здесь
+            # просто передаём user_id из запроса.
             "user_id": request.user_id,
             "reference_id": request.reference_id,
             "idempotency_key": request.idempotency_key,

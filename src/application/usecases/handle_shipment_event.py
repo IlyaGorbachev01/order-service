@@ -1,7 +1,7 @@
 import logging
 
 from src.application.ports.uow import BaseUnitOfWork
-from src.application.usecases.create_order import NotificationPort
+from src.application.usecases.notify_order_status import enqueue_status_notification
 from src.domain.events import ShipmentReceivedEvent
 from src.domain.exceptions import (
     DuplicateInboxEventError,
@@ -37,12 +37,10 @@ class HandleShipmentEventUseCase:
     def __init__(
         self,
         uow: BaseUnitOfWork,
-        notifier: NotificationPort,
     ):
         self._uow = uow
-        # Нотификатор передаётся СТРОГО через конструктор (DI): use case не
-        # создаёт инфраструктурные реализации сам и ничего о них не знает.
-        self._notifier = notifier
+        # Уведомления доставляются через transactional outbox (запись
+        # NOTIFICATION в той же транзакции, что и смена статуса).
 
     async def __call__(self, event: ShipmentReceivedEvent) -> None:
         """Обработать событие доставки.
@@ -105,7 +103,11 @@ class HandleShipmentEventUseCase:
                 await uow.inbox.mark_processed(event)
                 return
 
-            # 4. Атомарно: заказ + факт обработки события (Inbox)
+            # 4. Уведомление о новом статусе (SHIPPED/CANCELLED) — в ЭТУ ЖЕ
+            #    транзакцию, атомарно со сменой статуса и Inbox-записью.
+            await enqueue_status_notification(uow.outbox, order)
+
+            # 5. Атомарно: заказ + факт обработки события (Inbox)
             await uow.orders.update(order)
             try:
                 await uow.inbox.mark_processed(event)
@@ -123,8 +125,3 @@ class HandleShipmentEventUseCase:
                 event.event_id,
                 event.event_type,
             )
-
-        # Уведомление о новом статусе (SHIPPED/CANCELLED) — после
-        # коммита транзакции. Ошибки Notifications Service логируются
-        # внутри OrderNotifier и не прерывают обработку события консьюмером.
-        await self._notifier.notify(order)

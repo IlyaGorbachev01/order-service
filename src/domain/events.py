@@ -25,6 +25,61 @@ class DomainEvent:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
+# --- Типы записей таблицы Outbox ---------------------------------------------
+# Outbox — единый надёжный канал побочных эффектов (at-least-once): запись с
+# Kafka-топиком публикуется в брокер, запись NOTIFICATION доставляется HTTP-
+# клиентом Notifications Service. Воркер разбирает партии по этому признаку.
+
+
+class OutboxEventType(StrEnum):
+    """Назначение записи outbox: куда и как её доставлять."""
+
+    KAFKA_EVENT = "kafka_event"
+    NOTIFICATION = "notification"
+
+
+@dataclass(frozen=True)
+class NotificationCommand(DomainEvent):
+    """Команда доставки уведомления о статусе заказа (через Outbox).
+
+    Доменный value object: фиксирует факт «при переходе заказа в `status`
+    пользователя нужно уведомить». Пишется в outbox В ТОЙ ЖЕ транзакции,
+    что и смена статуса, поэтому уведомление переживает любой рестарт
+    процесса (at-least-once). Повторная доставка безопасна: ключ
+    идемпотентности детерминирован — `{order_id}:{status}` (см.
+    `domain.notifications.notification_idempotency_key`).
+
+    Текст сообщения НЕ хранится в команде: он генерируется на границе
+    отправки из `status` + `reason` (домен), чтобы не дублировать один
+    источник правды в двух местах.
+    """
+
+    order_id: str = ""
+    user_id: str = ""
+    status: str = ""
+    reason: str | None = None
+
+    def to_payload(self) -> dict:
+        """Сериализация команды в JSON payload записи outbox."""
+        return {
+            "event_type": OutboxEventType.NOTIFICATION.value,
+            "order_id": self.order_id,
+            "user_id": self.user_id,
+            "status": self.status,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "NotificationCommand":
+        """Восстановить команду из JSON payload'а записи outbox."""
+        return cls(
+            order_id=str(payload.get("order_id", "")),
+            user_id=str(payload.get("user_id", "")),
+            status=str(payload.get("status", "")),
+            reason=payload.get("reason"),
+        )
+
+
 @dataclass(frozen=True)
 class OrderPaidEvent(DomainEvent):
     """Событие `order.paid`: заказ оплачен, готов к доставке.

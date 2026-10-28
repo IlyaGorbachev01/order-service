@@ -344,6 +344,10 @@ class CreateOrderUseCase:
                     fresh.payment_id = result.id
 
                 updated = await uow.orders.update(fresh)
+                # Уведомление об итоге платежа (PAID/CANCELLED) — ДО commit(),
+                # в ту же транзакцию, что и update()
+                if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
+                    await enqueue_status_notification(uow.outbox, updated)
                 await uow.commit()
                 logger.info(
                     "Order %s: payment %s created, status=%s",
@@ -351,11 +355,6 @@ class CreateOrderUseCase:
                     result.id,
                     updated.status.value,
                 )
-                # Уведомление о синхронном итоге платежа (PAID/CANCELLED) —
-                # в ту же транзакцию, что и update() заказа (атомарно).
-                # Для PENDING итог придёт на callback и будет поставлен там.
-                if updated.status in (OrderStatus.PAID, OrderStatus.CANCELLED):
-                    await enqueue_status_notification(uow.outbox, updated)
                 return updated
         except PaymentServiceError:
             raise
